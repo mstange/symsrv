@@ -1,42 +1,24 @@
 [package]
-name = "profiler-symbol-server"
-version = "0.12.0"
+name = "symsrv"
+version = "0.1.0"
+edition = "2021"
 authors = ["Markus Stange <mstange@themasta.com>"]
-edition = "2018"
 license = "MIT/Apache-2.0"
-description = "A local webserver that lets the Firefox profiler obtain symbol information."
-repository = "https://github.com/mstange/profiler-symbol-server/"
+description = "A Microsoft symsrv symbol server consumer (downloader + cache)"
+repository = "https://github.com/mstange/symsrv/"
 readme = "README.md"
 
-[dependencies.object]
-default-features = false
-features = ["std", "read_core", "macho", "unaligned"]
-version = "0.28.1"
-
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-hyper = { version = "0.14.18", features = ["full"] }
-tokio = { version = "1.17.0", features = ["rt", "fs", "rt-multi-thread", "macros"]  }
-futures = "0.3"
-profiler-get-symbols = { version = "0.14.0", features = ["send_futures"] }
-# profiler-get-symbols = { path = "../profiler-get-symbols/lib", features = ["send_futures"] }
+reqwest = { version = "0.11.10", features = [
+    "default-tls",
+    "gzip",
+    "brotli",
+    "deflate"
+] }
+bytes = "1.1.0"
+dirs = "4.0"
+tokio = { version = "1.17.0", features = ["fs"] }
+thiserror = "1.0.26"
+cab = "0.4.0"
 memmap2 = "0.5.0"
-serde_json = "1.0.53"
-uuid = "1.0.0"
-structopt = "0.3.14"
-percent-encoding = "2.1.0"
-libc = "0.2.71"
-flate2 = "1.0"
-webbrowser = "0.7.0"
-rand = "0.8.4"
-nix-base32 = "0.1.1"
-serde_derive = "1.0.137"
-serde = "1.0.137"
-symsrv = { path = "./symsrv" }
-
-# Needed for moria_mac_spotlight, to find dSYM files
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation-sys = "0.8.2"
-core-foundation = "0.9.1"
-
-[profile.release]
-debug = true

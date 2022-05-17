@@ -1,604 +1,563 @@
-use flate2::read::GzDecoder;
-use hyper::body::Bytes;
-use hyper::server::conn::AddrIncoming;
-use hyper::server::Builder;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{header, Body, Request, Response, Server};
-use hyper::{Method, StatusCode};
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use profiler_get_symbols::{
-    self, debugid::DebugId, query_api, CandidatePathInfo, FileAndPathHelper,
-    FileAndPathHelperResult, FileLocation, OptionallySendFuture,
-};
-use rand::RngCore;
-use serde_derive::Deserialize;
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::BufReader;
-use std::net::SocketAddr;
-use std::ops::Range;
+//! # symsrv
+//!
+//! This crate lets you download and cache pdb files from symbol servers,
+//! according to the rules from the `_NT_SYMBOL_PATH` environment variable.
+//!
+//! It exposes an async API and uses of `reqwest` and `tokio::fs`.
+//!
+//! The downloaded symbols are stored and never evicted.
+//!
+//! ## Microsoft Documentation
+//!
+//! - [Advanced SymSrv Use](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use)
+//!
+//! ## Example
+//!
+//! ```
+//! use std::path::PathBuf;
+//! use symsrv::{get_symbol_path_from_environment, SymbolCache};
+//!
+//! # fn use_pdb_bytes(b: &[u8]) {}
+//! #
+//! # async fn wrapper() -> Result<(), symsrv::Error> {
+//! // Parse the _NT_SYMBOL_PATH environment variable.
+//! let symbol_path =
+//!     get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
+//!
+//! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
+//! let symbol_cache = SymbolCache::new(symbol_path, false);
+//! 
+//! // Download and cache a PDB file.
+//! let relative_path: PathBuf =
+//!     ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
+//! let file_contents = symbol_cache.get_pdb(&relative_path).await?;
+//! 
+//! // Use the PDB file contents.
+//! use_pdb_bytes(&file_contents[..]);
+//! # Ok(())
+//! # }
+//! ```
+
+use std::ffi::OsStr;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::str::FromStr;
-use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 
-mod moria_mac;
+use bytes::Bytes;
 
-#[cfg(target_os = "macos")]
-mod moria_mac_spotlight;
-
-pub use symsrv::{
-    get_default_downstream_store, get_symbol_path_from_environment, parse_nt_symbol_path,
-    NtSymbolPathEntry,
-};
-use symsrv::{FileContents, SymbolCache};
-
-const BAD_CHARS: &AsciiSet = &CONTROLS.add(b':').add(b'/');
-
-#[derive(Clone, Debug)]
-pub enum PortSelection {
-    OnePort(u16),
-    TryMultiple(Range<u16>),
+/// This is how the symbol file contents are returned. If there's an uncompressed file
+/// in the store, then we return an Mmap of that uncompressed file. If there is no
+/// local file or the local file is compressed, then we load or uncompress the file
+/// into memory and return a `Bytes` wrapper of that memory.
+///
+/// This type can be coerced to a [u8] slice with `&file_contents[..]`.
+pub enum FileContents {
+    /// A mapped file.
+    Mmap(memmap2::Mmap),
+    /// Bytes in memory.
+    Bytes(Bytes),
 }
 
-impl PortSelection {
-    pub fn try_from_str(s: &str) -> std::result::Result<Self, <u16 as FromStr>::Err> {
-        if s.ends_with('+') {
-            let start = s.trim_end_matches('+').parse()?;
-            let end = start + 100;
-            Ok(PortSelection::TryMultiple(start..end))
-        } else {
-            Ok(PortSelection::OnePort(s.parse()?))
+impl std::ops::Deref for FileContents {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileContents::Mmap(mmap) => mmap,
+            FileContents::Bytes(bytes) => bytes,
         }
     }
 }
 
-pub async fn start_server(
-    profile_filename: Option<&Path>,
-    port_selection: PortSelection,
+/// The parsed representation of one entry in the (semicolon-separated list of entries in the) `_NT_SYMBOL_PATH` environment variable.
+/// The syntax of this string is documented at <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NtSymbolPathEntry {
+    /// Sets a cache path that will be used for subsequent entries, and for any symbol paths that get added at runtime.
+    /// Created for `cache*` entries.
+    Cache(PathBuf),
+    /// A fallback-and-cache chain with optional http / https symbol servers at the end.
+    /// Created for `srv*` and `symsrv*` entries.
+    Chain {
+        /// Usually `symsrv.dll`. (`srv*...` is shorthand for `symsrv*symsrv.dll*...`.)
+        dll: String,
+        /// Any cache directories. The first directory is the "bottom-most" cache, and is always
+        // checked first, and always stores uncompressed files.
+        /// Any remaining directories are mid-level cache directories. These can store compressed files.
+        cache_paths: Vec<PathBuf>,
+        /// Symbol server URLs. Can serve compressed or uncompressed files. Not used as a cache target.
+        /// These are checked last.
+        urls: Vec<String>,
+    },
+    /// A path where symbols can be found but which is not used as a cache target.
+    /// Created for entries which are just a path.
+    LocalOrShare(PathBuf),
+}
+
+/// Currently returns ~/sym.
+pub fn get_default_downstream_store() -> Option<PathBuf> {
+    // The Windows Debugger chooses the default downstream store as follows (see
+    // <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>):
+    // > If you include two asterisks in a row where a downstream store would normally be specified,
+    // > then the default downstream store is used. This store will be located in the sym subdirectory
+    // > of the home directory. The home directory defaults to the debugger installation directory;
+    // > this can be changed by using the !homedir extension or by setting the DBGHELP_HOMEDIR
+    // > environment variable.
+    //
+    // Let's ignore the part about the "debugger installation directory" and put the default
+    // store at ~/sym.
+    dirs::home_dir().map(|home_dir| home_dir.join("sym"))
+}
+
+/// Reads the `_NT_SYMBOL_PATH` environment variable and parses it.
+/// The parsed path entries use ~/sym as the default downstream store.
+pub fn get_symbol_path_from_environment(fallback_if_unset: &str) -> Vec<NtSymbolPathEntry> {
+    let default_downstream_store = get_default_downstream_store();
+    if let Ok(symbol_path) = std::env::var("_NT_SYMBOL_PATH") {
+        parse_nt_symbol_path(&symbol_path, default_downstream_store.as_deref())
+    } else {
+        parse_nt_symbol_path(fallback_if_unset, default_downstream_store.as_deref())
+    }
+}
+
+/// Parse the value of the `_NT_SYMBOL_PATH` variable. The format of this variable
+/// is a semicolon-separated list of entries, where each entry is an asterisk-separated
+/// hierarchy of symbol locations which can be either directories or server URLs.
+pub fn parse_nt_symbol_path(
+    symbol_path: &str,
+    default_downstream_store: Option<&Path>,
+) -> Vec<NtSymbolPathEntry> {
+    fn chain<'a>(
+        dll_name: &str,
+        parts: impl Iterator<Item = &'a str>,
+        default_downstream_store: Option<&Path>,
+    ) -> NtSymbolPathEntry {
+        let mut cache_paths: Vec<PathBuf> = Vec::new();
+        let mut urls: Vec<String> = Vec::new();
+        for part in parts {
+            if part.is_empty() {
+                if let Some(default_downstream_store) = default_downstream_store {
+                    cache_paths.push(default_downstream_store.into());
+                }
+            } else if part.starts_with("http://") || part.starts_with("https://") {
+                urls.push(part.into());
+            } else {
+                cache_paths.push(part.into());
+            }
+        }
+        NtSymbolPathEntry::Chain {
+            dll: dll_name.to_string(),
+            cache_paths,
+            urls,
+        }
+    }
+
+    symbol_path
+        .split(';')
+        .filter_map(|segment| {
+            let mut parts = segment.split('*');
+            let first = parts.next().unwrap();
+            match first.to_ascii_lowercase().as_str() {
+                "cache" => parts
+                    .next()
+                    .map(|path| NtSymbolPathEntry::Cache(path.into())),
+                "srv" => Some(chain("symsrv.dll", parts, default_downstream_store)),
+                "symsrv" => parts
+                    .next()
+                    .map(|dll_name| chain(dll_name, parts, default_downstream_store)),
+                _ => Some(NtSymbolPathEntry::LocalOrShare(first.into())),
+            }
+        })
+        .collect()
+}
+
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("IO error: {0}")]
+    IoError(#[source] std::io::Error),
+
+    #[error("The PDB was not found in the SymbolCache.")]
+    NotFound,
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Error::IoError(err)
+    }
+}
+
+/// Obtains symbols according to the instructions in the symbol path.
+pub struct SymbolCache {
     symbol_path: Vec<NtSymbolPathEntry>,
     verbose: bool,
-    open_in_browser: bool,
-) {
-    let path_map = if let Some(profile_filename) = profile_filename {
-        // Read the profile.json file and parse it as JSON.
-        // Build a map (debugName, breakpadID) -> debugPath from the information
-        // in profile(\.processes\[\d+\])*(\.threads\[\d+\])?\.libs.
-        let file = std::fs::File::open(profile_filename).expect("couldn't read file");
-        let reader = BufReader::new(file);
-
-        // Handle .gz profiles
-        if profile_filename.extension() == Some(&OsString::from("gz")) {
-            let decoder = GzDecoder::new(reader);
-            let reader = BufReader::new(decoder);
-            parse_path_map_from_profile(reader).expect("couldn't parse json")
-        } else {
-            parse_path_map_from_profile(reader).expect("couldn't parse json")
-        }
-    } else {
-        HashMap::new()
-    };
-
-    let (builder, addr) = make_builder_at_port(port_selection);
-
-    let token = generate_token();
-    let path_prefix = format!("/{}", token);
-    let server_origin = format!("http://{}", addr);
-    let symbol_server_url = format!("{}{}", server_origin, path_prefix);
-    let mut template_values: HashMap<&'static str, String> = HashMap::new();
-    template_values.insert("SERVER_URL", server_origin.clone());
-    template_values.insert("PATH_PREFIX", path_prefix.clone());
-
-    let profiler_url = if profile_filename.is_some() {
-        let profile_url = format!("{}/profile.json", symbol_server_url);
-
-        let env_profiler_override = std::env::var("PROFILER_URL").ok();
-        let profiler_origin = match &env_profiler_override {
-            Some(s) => s.trim_end_matches('/'),
-            None => "https://profiler.firefox.com",
-        };
-
-        let encoded_profile_url = utf8_percent_encode(&profile_url, BAD_CHARS).to_string();
-        let encoded_symbol_server_url =
-            utf8_percent_encode(&symbol_server_url, BAD_CHARS).to_string();
-        let profiler_url = format!(
-            "{}/from-url/{}/?symbolServer={}",
-            profiler_origin, encoded_profile_url, encoded_symbol_server_url
-        );
-        template_values.insert("PROFILER_URL", profiler_url.clone());
-        template_values.insert("PROFILE_URL", profile_url);
-        Some(profiler_url)
-    } else {
-        None
-    };
-
-    let template_values = Arc::new(template_values);
-
-    let helper = Arc::new(Helper::with_path_map(path_map, symbol_path, verbose));
-    let new_service = make_service_fn(move |_conn| {
-        let helper = helper.clone();
-        let profile_filename = profile_filename.map(PathBuf::from);
-        let template_values = template_values.clone();
-        let path_prefix = path_prefix.clone();
-        async {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                symbolication_service(
-                    req,
-                    template_values.clone(),
-                    helper.clone(),
-                    profile_filename.clone(),
-                    path_prefix.clone(),
-                )
-            }))
-        }
-    });
-
-    let server = builder.serve(new_service);
-
-    eprintln!("Local server listening at {}", server_origin);
-    if !open_in_browser {
-        if let Some(profiler_url) = &profiler_url {
-            eprintln!("  Open the profiler at {}", profiler_url);
-        }
-    }
-    eprintln!("Press Ctrl+C to stop.");
-
-    if open_in_browser {
-        if let Some(profiler_url) = &profiler_url {
-            let _ = webbrowser::open(profiler_url);
-        }
-    }
-
-    // Run this server for... forever!
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
-    }
 }
 
-fn parse_path_map_from_profile(
-    reader: impl std::io::Read,
-) -> Result<HashMap<(String, DebugId), String>, std::io::Error> {
-    let profile: ProfileJsonProcess = serde_json::from_reader(reader)?;
-    let mut path_map = HashMap::new();
-    add_to_path_map_recursive(&profile, &mut path_map);
-    Ok(path_map)
-}
-
-#[derive(Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ProfileJsonProcess {
-    #[serde(default)]
-    pub libs: Vec<ProfileJsonLib>,
-    #[serde(default)]
-    pub threads: Vec<ProfileJsonThread>,
-    #[serde(default)]
-    pub processes: Vec<ProfileJsonProcess>,
-}
-
-#[derive(Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ProfileJsonThread {
-    #[serde(default)]
-    pub libs: Vec<ProfileJsonLib>,
-}
-
-#[derive(Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ProfileJsonLib {
-    pub debug_name: Option<String>,
-    pub debug_path: Option<String>,
-    pub breakpad_id: Option<String>,
-}
-
-// Returns a base32 string for 24 random bytes.
-fn generate_token() -> String {
-    let mut bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    nix_base32::to_nix_base32(&bytes)
-}
-
-fn make_builder_at_port(port_selection: PortSelection) -> (Builder<AddrIncoming>, SocketAddr) {
-    match port_selection {
-        PortSelection::OnePort(port) => {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            match Server::try_bind(&addr) {
-                Ok(builder) => (builder, addr),
-                Err(e) => {
-                    eprintln!("Could not bind to port {}: {}", port, e);
-                    std::process::exit(1)
-                }
-            }
-        }
-        PortSelection::TryMultiple(range) => {
-            let mut error = None;
-            for port in range.clone() {
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                match Server::try_bind(&addr) {
-                    Ok(builder) => return (builder, addr),
-                    Err(e) => {
-                        error.get_or_insert(e);
-                    }
-                }
-            }
-            match error {
-                Some(error) => {
-                    eprintln!(
-                        "Could not bind to any port in the range {:?}: {}",
-                        range, error,
-                    );
-                }
-                None => {
-                    eprintln!("Binding failed, port range empty? {:?}", range);
-                }
-            }
-            std::process::exit(1)
-        }
-    }
-}
-
-const TEMPLATE_WITH_PROFILE: &str = r#"
-<!DOCTYPE html>
-<html lang="en">
-<meta charset="utf-8">
-<title>Profiler Symbol Server</title>
-<body>
-
-<p>This is the profiler symbol server, running at <code>SERVER_URL</code>. You can:</p>
-<ul>
-    <li><a href="PROFILER_URL">Open the profile in the profiler UI</a></li>
-    <li><a download href="PROFILE_URL">Download the raw profile JSON</a></li>
-    <li>Obtain symbols by POSTing to <code>PATH_PREFIX/symbolicate/v5</code>, with the format specified by the <a href="https://tecken.readthedocs.io/en/latest/symbolication.html">Mozilla symbolication API documentation</a>.</li>
-    <li>Obtain source code by POSTing to <code>PATH_PREFIX/source/v1</code>, with the format specified in this <a href="https://github.com/mstange/profiler-get-symbols/issues/24#issuecomment-989985588">github comment</a>.</li>
-</ul>
-"#;
-
-const TEMPLATE_WITHOUT_PROFILE: &str = r#"
-<!DOCTYPE html>
-<html lang="en">
-<meta charset="utf-8">
-<title>Profiler Symbol Server</title>
-<body>
-
-<p>This is the profiler symbol server, running at <code>SERVER_URL</code>. You can:</p>
-<ul>
-    <li>Obtain symbols by POSTing to <code>PATH_PREFIX/symbolicate/v5</code>, with the format specified by the <a href="https://tecken.readthedocs.io/en/latest/symbolication.html">Mozilla symbolication API documentation</a>.</li>
-    <li>Obtain source code by POSTing to <code>PATH_PREFIX/source/v1</code>, with the format specified in this <a href="https://github.com/mstange/profiler-get-symbols/issues/24#issuecomment-989985588">github comment</a>.</li>
-</ul>
-"#;
-
-async fn symbolication_service(
-    req: Request<Body>,
-    template_values: Arc<HashMap<&'static str, String>>,
-    helper: Arc<Helper>,
-    profile_filename: Option<PathBuf>,
-    path_prefix: String,
-) -> Result<Response<Body>, hyper::Error> {
-    let has_profile = profile_filename.is_some();
-    let method = req.method();
-    let path = req.uri().path();
-    let mut response = Response::new(Body::empty());
-
-    let path_without_prefix = match path.strip_prefix(&path_prefix) {
-        None => {
-            // The secret prefix was not part of the URL. Do not send CORS headers.
-            match (method, path) {
-                (&Method::GET, "/") => {
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        header::HeaderValue::from_static("text/html"),
-                    );
-                    let template = match has_profile {
-                        true => TEMPLATE_WITH_PROFILE,
-                        false => TEMPLATE_WITHOUT_PROFILE,
-                    };
-                    *response.body_mut() =
-                        Body::from(substitute_template(template, &*template_values));
-                }
-                _ => {
-                    *response.status_mut() = StatusCode::NOT_FOUND;
-                }
-            }
-            return Ok(response);
-        }
-        Some(path_without_prefix) => path_without_prefix,
-    };
-
-    // If we get here, then the secret prefix was part of the URL.
-    // This part is open to the public: we allow requests across origins.
-    // For background on CORS, see this document:
-    // https://w3c.github.io/webappsec-cors-for-developers/#cors
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        header::HeaderValue::from_static("*"),
-    );
-
-    match (method, path_without_prefix, profile_filename) {
-        (&Method::OPTIONS, _, _) => {
-            // https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/OPTIONS
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            if req
-                .headers()
-                .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
-            {
-                // This is a CORS preflight request.
-                // Reassure the client that we are CORS-aware and that it's free to request whatever.
-                response.headers_mut().insert(
-                    header::ACCESS_CONTROL_ALLOW_METHODS,
-                    header::HeaderValue::from_static("POST, GET, OPTIONS"),
-                );
-                response.headers_mut().insert(
-                    header::ACCESS_CONTROL_MAX_AGE,
-                    header::HeaderValue::from(86400),
-                );
-                if let Some(req_headers) = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-                {
-                    // All headers are fine.
-                    response
-                        .headers_mut()
-                        .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, req_headers.clone());
-                }
-            } else {
-                // This is a regular OPTIONS request. Just send an Allow header with the allowed methods.
-                response.headers_mut().insert(
-                    header::ALLOW,
-                    header::HeaderValue::from_static("POST, GET, OPTIONS"),
-                );
-            }
-        }
-        (&Method::GET, "/profile.json", Some(profile_filename)) => {
-            if profile_filename.extension() == Some(OsStr::new("gz")) {
-                response.headers_mut().insert(
-                    header::CONTENT_ENCODING,
-                    header::HeaderValue::from_static("gzip"),
-                );
-            }
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/json; charset=UTF-8"),
-            );
-            let (mut sender, body) = Body::channel();
-            *response.body_mut() = body;
-
-            // Stream the file out to the response body, asynchronously, after this function has returned.
-            tokio::spawn(async move {
-                let mut file = tokio::fs::File::open(&profile_filename)
-                    .await
-                    .expect("couldn't open profile file");
-                let mut contents = vec![0; 1024 * 1024];
-                loop {
-                    let data_len = file
-                        .read(&mut contents)
-                        .await
-                        .expect("couldn't read profile file");
-                    if data_len == 0 {
-                        break;
-                    }
-                    sender
-                        .send_data(Bytes::copy_from_slice(&contents[..data_len]))
-                        .await
-                        .expect("couldn't send data");
-                }
-            });
-        }
-        (&Method::POST, path, _) => {
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/json"),
-            );
-            let path = path.to_string();
-            // Await the full body to be concatenated into a single `Bytes`...
-            let full_body = hyper::body::to_bytes(req.into_body()).await?;
-            let full_body = String::from_utf8(full_body.to_vec()).expect("invalid utf-8");
-            let response_json = query_api(&path, &full_body, &*helper).await;
-
-            *response.body_mut() = response_json.into();
-        }
-        _ => {
-            *response.status_mut() = StatusCode::NOT_FOUND;
-        }
-    };
-
-    Ok(response)
-}
-
-fn substitute_template(template: &str, template_values: &HashMap<&'static str, String>) -> String {
-    let mut s = template.to_string();
-    for (key, value) in template_values {
-        s = s.replace(key, value);
-    }
-    s
-}
-
-struct Helper {
-    path_map: HashMap<(String, DebugId), String>,
-    symbol_cache: SymbolCache,
-    verbose: bool,
-}
-
-fn add_libs_to_path_map(
-    libs: &[ProfileJsonLib],
-    path_map: &mut HashMap<(String, DebugId), String>,
-) {
-    for lib in libs {
-        if let Some(((debug_name, debug_id), debug_path)) = path_map_entry_for_lib(lib) {
-            path_map.insert((debug_name, debug_id), debug_path);
-        }
-    }
-}
-
-fn path_map_entry_for_lib(lib: &ProfileJsonLib) -> Option<((String, DebugId), String)> {
-    let debug_name = lib.debug_name.clone()?;
-    let breakpad_id = lib.breakpad_id.as_ref()?;
-    let debug_path = lib.debug_path.clone()?;
-    let debug_id = DebugId::from_breakpad(breakpad_id).ok()?;
-    Some(((debug_name, debug_id), debug_path))
-}
-
-fn add_to_path_map_recursive(
-    profile: &ProfileJsonProcess,
-    path_map: &mut HashMap<(String, DebugId), String>,
-) {
-    add_libs_to_path_map(&profile.libs, path_map);
-    for thread in &profile.threads {
-        add_libs_to_path_map(&thread.libs, path_map);
-    }
-    for process in &profile.processes {
-        add_to_path_map_recursive(process, path_map);
-    }
-}
-
-impl Helper {
-    pub fn with_path_map(
-        path_map: HashMap<(String, DebugId), String>,
-        symbol_path: Vec<NtSymbolPathEntry>,
-        verbose: bool,
-    ) -> Self {
-        let symbol_cache = SymbolCache::new(symbol_path, verbose);
-        Helper {
-            path_map,
-            symbol_cache,
+impl SymbolCache {
+    /// Create a new `SymbolCache`. If `verbose` is set to `true`, log messages
+    /// will be printed to stderr.
+    pub fn new(symbol_path: Vec<NtSymbolPathEntry>, verbose: bool) -> Self {
+        Self {
+            symbol_path,
             verbose,
         }
     }
 
-    async fn open_file_impl(
-        &self,
-        location: FileLocation,
-    ) -> FileAndPathHelperResult<FileContents> {
-        match location {
-            FileLocation::Path(path) => {
+    /// This is the primary entry point to fetch symbols. It takes a relative
+    /// `path` of the form `name.pdb\HEX\name.pdb`, and then looks up the
+    /// file according to the recipe of this `SymbolCache`. That means it searches
+    /// cache directories, downloads symbols as needed, and uncompresses files
+    /// as needed.
+    pub async fn get_pdb(&self, path: &Path) -> Result<FileContents, Error> {
+        match self.get_pdb_impl(path).await {
+            Ok(file_contents) => {
                 if self.verbose {
-                    eprintln!("Opening file {:?}", path.to_string_lossy());
+                    eprintln!("Successfully obtained {:?} from the symbol cache.", path);
                 }
-                let file = File::open(&path)?;
-                Ok(FileContents::Mmap(unsafe {
-                    memmap2::MmapOptions::new().map(&file)?
-                }))
+                Ok(file_contents)
             }
-            FileLocation::Custom(custom) => {
-                assert!(custom.starts_with("symbolserver:"));
-                let path = custom.trim_start_matches("symbolserver:");
+            Err(e) => {
                 if self.verbose {
-                    eprintln!("Trying to get file {:?} from symbol cache", path);
+                    eprintln!("Encountered an error when trying to obtain {:?} from the symbol cache: {:?}", path, e);
                 }
-                Ok(self.symbol_cache.get_pdb(Path::new(path)).await?)
+                Err(e)
             }
         }
+    }
+
+    /// `path` should be a path of the form firefox.pdb\HEX\firefox.pdb
+    async fn get_pdb_impl(&self, rel_path_uncompressed: &Path) -> Result<FileContents, Error> {
+        assert!(rel_path_uncompressed.extension() == Some(OsStr::new("pdb")));
+        let mut rel_path_compressed = rel_path_uncompressed.to_owned();
+        rel_path_compressed.set_extension("pd_");
+
+        // The cache paths frome `cache*` entries, which apply to all subsequent
+        // entries.
+        let mut persisted_cache_paths: Vec<PathBuf> = Vec::new();
+
+        // Iterate all entries in the symbol path, checking them for matches one by one.
+        for entry in &self.symbol_path {
+            match entry {
+                NtSymbolPathEntry::Cache(cache_path) => {
+                    if persisted_cache_paths.contains(cache_path) {
+                        continue;
+                    }
+
+                    // Add this path to `persisted_cache_paths` so that any matches in the
+                    // upcoming entries can be persisted to this cache.
+                    persisted_cache_paths.push(cache_path.clone());
+
+                    // Check if the symbol file is present in this cache. If found, also persist
+                    // it to the previous cache paths.
+                    let (_, parent_cache_paths) = persisted_cache_paths.split_last().unwrap();
+                    if let Some(file_contents) = self
+                        .check_directory(
+                            cache_path,
+                            parent_cache_paths,
+                            rel_path_uncompressed,
+                            &rel_path_compressed,
+                        )
+                        .await?
+                    {
+                        return Ok(file_contents);
+                    };
+                }
+                NtSymbolPathEntry::Chain {
+                    cache_paths, urls, ..
+                } => {
+                    // If the symbol file is found, it should also be persisted (copied) to all
+                    // of these paths.
+                    let mut parent_cache_paths = persisted_cache_paths.clone();
+
+                    for cache_path in cache_paths {
+                        if parent_cache_paths.contains(cache_path) {
+                            continue;
+                        }
+                        parent_cache_paths.push(cache_path.clone());
+
+                        // Check if the symbol file is present at this path. If found, also persist
+                        // it to the previous cache paths.
+                        let (_, parent_cache_paths) = parent_cache_paths.split_last().unwrap();
+                        if let Some(file_contents) = self
+                            .check_directory(
+                                cache_path,
+                                parent_cache_paths,
+                                rel_path_uncompressed,
+                                &rel_path_compressed,
+                            )
+                            .await?
+                        {
+                            return Ok(file_contents);
+                        };
+                    }
+
+                    // Download the symbol file from the URL(s) in this entry. If found, also persist
+                    // the file to the previous cache paths.
+                    for url in urls {
+                        if let Some(file_contents) = self
+                            .check_url(
+                                url,
+                                &parent_cache_paths,
+                                rel_path_uncompressed,
+                                &rel_path_compressed,
+                            )
+                            .await?
+                        {
+                            return Ok(file_contents);
+                        }
+                    }
+                }
+                NtSymbolPathEntry::LocalOrShare(dir_path) => {
+                    if persisted_cache_paths.contains(dir_path) {
+                        continue;
+                    }
+
+                    // Check if the symbol file is present at this path. If found, also persist
+                    // it to the previous cache paths.
+                    if let Some(file_contents) = self
+                        .check_directory(
+                            dir_path,
+                            &persisted_cache_paths,
+                            rel_path_uncompressed,
+                            &rel_path_compressed,
+                        )
+                        .await?
+                    {
+                        return Ok(file_contents);
+                    };
+                }
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    async fn check_file_exists(&self, path: &Path) -> bool {
+        match tokio::fs::metadata(path).await {
+            Ok(meta) if meta.is_file() => {
+                if self.verbose {
+                    eprintln!("Checking if {} exists... yes", path.to_string_lossy());
+                }
+                true
+            }
+            _ => {
+                if self.verbose {
+                    eprintln!("Checking if {} exists... no", path.to_string_lossy());
+                }
+                false
+            }
+        }
+    }
+
+    async fn check_directory(
+        &self,
+        dir: &Path,
+        parent_cache_paths: &[PathBuf],
+        rel_path_uncompressed: &Path,
+        rel_path_compressed: &Path,
+    ) -> Result<Option<FileContents>, Error> {
+        let full_candidate_path = dir.join(rel_path_uncompressed);
+        let full_candidate_path_compr = dir.join(&rel_path_compressed);
+
+        let (abs_path, is_compressed) = if self.check_file_exists(&full_candidate_path).await {
+            (full_candidate_path, false)
+        } else if self.check_file_exists(&full_candidate_path_compr).await {
+            (full_candidate_path_compr, true)
+        } else {
+            return Ok(None);
+        };
+
+        // We found a file. Yay!
+
+        let uncompressed_path = if is_compressed {
+            let file = tokio::fs::File::open(&abs_path).await?;
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
+                // We have at least one cache, and the file is compressed.
+                // Copy the compressed file to the mid-level caches, and uncompress the file
+                // into the bottom-most cache.
+                self.copy_file_to_caches(rel_path_compressed, &abs_path, mid_level_caches)
+                    .await;
+                self.extract_to_file_in_cache(&mmap[..], rel_path_uncompressed, bottom_most_cache)
+                    .await?
+            } else {
+                // We have no cache. Extract it into memory.
+                let vec = self.extract_into_memory(&mmap[..])?;
+                return Ok(Some(FileContents::Bytes(Bytes::from(vec))));
+            }
+        } else {
+            abs_path
+        };
+
+        let file = tokio::fs::File::open(&uncompressed_path).await?;
+        Ok(Some(FileContents::Mmap(unsafe {
+            memmap2::MmapOptions::new().map(&file)?
+        })))
+    }
+
+    async fn check_url(
+        &self,
+        url: &str,
+        parent_cache_paths: &[PathBuf],
+        rel_path_uncompressed: &Path,
+        rel_path_compressed: &Path,
+    ) -> Result<Option<FileContents>, Error> {
+        let full_candidate_url = url_join(url, rel_path_uncompressed.components());
+        let full_candidate_url_compr = url_join(url, rel_path_compressed.components());
+        let (bytes, is_compressed) = match self.get_bytes_from_url(&full_candidate_url_compr).await
+        {
+            Some(bytes) => (bytes, true),
+            None => match self.get_bytes_from_url(&full_candidate_url).await {
+                Some(bytes) => (bytes, false),
+                None => return Ok(None),
+            },
+        };
+
+        // We have a file!
+        let file_contents = if is_compressed {
+            if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
+                // We have at least one cache, and the file is compressed.
+                // Save the compressed file to the mid-level caches, and uncompress the file
+                // into the bottom-most cache.
+                if let Some((one_mid_level_cache, other_mid_level_caches)) =
+                    mid_level_caches.split_first()
+                {
+                    if let Ok(abs_compressed_path) = self
+                        .save_file_to_cache(&bytes[..], rel_path_compressed, one_mid_level_cache)
+                        .await
+                    {
+                        let _ = self
+                            .copy_file_to_caches(
+                                rel_path_compressed,
+                                &abs_compressed_path,
+                                other_mid_level_caches,
+                            )
+                            .await;
+                    }
+                }
+                let uncompressed_path = self
+                    .extract_to_file_in_cache(&bytes[..], rel_path_uncompressed, bottom_most_cache)
+                    .await?;
+                let file = tokio::fs::File::open(&uncompressed_path).await?;
+                FileContents::Mmap(unsafe { memmap2::MmapOptions::new().map(&file)? })
+            } else {
+                // We have no cache. Extract the bytes into memory.
+                let vec = self.extract_into_memory(&bytes[..])?;
+                FileContents::Bytes(Bytes::from(vec))
+            }
+        } else {
+            // The file is not compressed. Just store.
+            if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
+                // We have at least one cache, and the file is NOT compressed.
+                // Save the file to the bottom-most cache, and copy it into the mid-level caches.
+                if let Ok(abs_compressed_path) = self
+                    .save_file_to_cache(&bytes[..], rel_path_uncompressed, bottom_most_cache)
+                    .await
+                {
+                    let _ = self
+                        .copy_file_to_caches(
+                            rel_path_uncompressed,
+                            &abs_compressed_path,
+                            mid_level_caches,
+                        )
+                        .await;
+                }
+            } else {
+                // No caching. Don't do anything.
+            }
+            FileContents::Bytes(bytes)
+        };
+        Ok(Some(file_contents))
+    }
+
+    async fn copy_file_to_caches(&self, rel_path: &Path, abs_path: &Path, caches: &[PathBuf]) {
+        for cache_path in caches {
+            if let Ok(dest_path) = self
+                .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
+                .await
+            {
+                let _ = tokio::fs::copy(&abs_path, &dest_path).await;
+            }
+        }
+    }
+
+    async fn make_dest_path_and_ensure_parent_dirs(
+        &self,
+        rel_path: &Path,
+        cache_path: &Path,
+    ) -> Result<PathBuf, Error> {
+        let dest_path = cache_path.join(rel_path);
+        if let Some(dir) = dest_path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        Ok(dest_path)
+    }
+
+    async fn save_file_to_cache(
+        &self,
+        bytes: &[u8],
+        rel_path: &Path,
+        cache_path: &Path,
+    ) -> Result<PathBuf, Error> {
+        let dest_path = self
+            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
+            .await?;
+
+        let mut cursor = Cursor::new(bytes);
+        if self.verbose {
+            eprintln!("Saving bytes to {:?}.", dest_path);
+        }
+        let mut file = tokio::fs::File::create(&dest_path).await?;
+        tokio::io::copy(&mut cursor, &mut file).await?;
+        Ok(dest_path)
+    }
+
+    async fn extract_to_file_in_cache(
+        &self,
+        bytes: &[u8],
+        rel_path: &Path,
+        cache_path: &Path,
+    ) -> Result<PathBuf, Error> {
+        let extracted_bytes = self.extract_into_memory(bytes)?;
+        self.save_file_to_cache(&extracted_bytes, rel_path, cache_path)
+            .await
+    }
+
+    fn extract_into_memory(&self, bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        let cursor = Cursor::new(bytes);
+        let mut cabinet = cab::Cabinet::new(cursor)?;
+        let file_name_in_cab = {
+            // Only pick the first file we encounter. That's the PDB.
+            let folder = cabinet.folder_entries().next().unwrap();
+            let file = folder.file_entries().next().unwrap();
+            file.name().to_string()
+        };
+        if self.verbose {
+            eprintln!("Extracting {:?} into memory...", file_name_in_cab);
+        }
+        let mut reader = cabinet.read_file(&file_name_in_cab)?;
+        let mut vec = Vec::new();
+        std::io::copy(&mut reader, &mut vec)?;
+        Ok(vec)
+    }
+
+    async fn get_bytes_from_url(&self, url: &str) -> Option<Bytes> {
+        if self.verbose {
+            eprintln!("Downloading {}...", url);
+        }
+        let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
+        response.bytes().await.ok()
     }
 }
 
-impl<'h> FileAndPathHelper<'h> for Helper {
-    type F = FileContents;
-    type OpenFileFuture =
-        Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>>;
-
-    fn get_candidate_paths_for_binary_or_pdb(
-        &self,
-        debug_name: &str,
-        debug_id: &DebugId,
-    ) -> FileAndPathHelperResult<Vec<CandidatePathInfo>> {
-        let mut paths = vec![];
-
-        // Look up (debugName, breakpadId) in the path map.
-        if let Some(path) = self.path_map.get(&(debug_name.to_string(), *debug_id)) {
-            // First, see if we can find a dSYM file for the binary.
-            if let Ok(dsym_path) = moria_mac::locate_dsym(&path, debug_id.uuid()) {
-                paths.push(CandidatePathInfo::SingleFile(FileLocation::Path(
-                    dsym_path.clone(),
-                )));
-                paths.push(CandidatePathInfo::SingleFile(FileLocation::Path(
-                    dsym_path
-                        .join("Contents")
-                        .join("Resources")
-                        .join("DWARF")
-                        .join(debug_name),
-                )));
-            }
-
-            // Also consider .so.dbg files in the same directory.
-            if debug_name.ends_with(".so") {
-                let debug_debug_name = format!("{}.dbg", debug_name);
-                let path = PathBuf::from(path);
-                if let Some(dir) = path.parent() {
-                    paths.push(CandidatePathInfo::SingleFile(FileLocation::Path(
-                        dir.join(debug_debug_name),
-                    )));
-                }
-            }
-
-            // Fall back to getting symbols from the binary itself.
-            paths.push(CandidatePathInfo::SingleFile(FileLocation::Path(
-                path.into(),
-            )));
-
-            // For macOS system libraries, also consult the dyld shared cache.
-            if path.starts_with("/usr/") || path.starts_with("/System/") {
-                paths.push(CandidatePathInfo::InDyldCache {
-                    dyld_cache_path: Path::new("/System/Library/dyld/dyld_shared_cache_arm64e")
-                        .to_path_buf(),
-                    dylib_path: path.clone(),
-                });
-                paths.push(CandidatePathInfo::InDyldCache {
-                    dyld_cache_path: Path::new("/System/Library/dyld/dyld_shared_cache_x86_64h")
-                        .to_path_buf(),
-                    dylib_path: path.clone(),
-                });
-                paths.push(CandidatePathInfo::InDyldCache {
-                    dyld_cache_path: Path::new("/System/Library/dyld/dyld_shared_cache_x86_64")
-                        .to_path_buf(),
-                    dylib_path: path.clone(),
-                });
-            }
-        }
-
-        if debug_name.ends_with(".pdb") {
-            // We might find this pdb file with the help of a symbol server.
-            // Construct a custom string to identify this pdb.
-            let custom = format!(
-                "symbolserver:{}/{}/{}",
-                debug_name,
-                debug_id.breakpad(),
-                debug_name
-            );
-            paths.push(CandidatePathInfo::SingleFile(FileLocation::Custom(custom)));
-        }
-
-        Ok(paths)
-    }
-
-    fn open_file(
-        &'h self,
-        location: &FileLocation,
-    ) -> Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>> {
-        Box::pin(self.open_file_impl(location.clone()))
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::{ProfileJsonLib, ProfileJsonProcess};
-
-    #[test]
-    fn deserialize_profile_json() {
-        let p: ProfileJsonProcess = serde_json::from_str("{}").unwrap();
-        assert!(p.libs.is_empty());
-        assert!(p.threads.is_empty());
-        assert!(p.processes.is_empty());
-
-        let p: ProfileJsonProcess = serde_json::from_str("{\"unknown_field\":[1, 2, 3]}").unwrap();
-        assert!(p.libs.is_empty());
-        assert!(p.threads.is_empty());
-        assert!(p.processes.is_empty());
-
-        let p: ProfileJsonProcess =
-            serde_json::from_str("{\"threads\":[{\"libs\":[{}]}]}").unwrap();
-        assert!(p.libs.is_empty());
-        assert_eq!(p.threads.len(), 1);
-        assert_eq!(p.threads[0].libs.len(), 1);
-        assert_eq!(p.threads[0].libs[0], ProfileJsonLib::default());
-        assert!(p.processes.is_empty());
-    }
+/// Convert a relative `Path` into a URL by appending the components to the
+/// given base URL.
+fn url_join(base_url: &str, components: std::path::Components) -> String {
+    format!(
+        "{}/{}",
+        base_url,
+        components
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
