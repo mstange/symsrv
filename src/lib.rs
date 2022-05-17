@@ -42,6 +42,14 @@ use std::ffi::OsStr;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+/// A re-export of the `bytes` crate, because this crate uses the type `Bytes`
+/// in its public API.
+pub use bytes;
+
+/// A re-export of the `memmap2` crate, because this crate uses the type `Mmap`
+/// in its public API.
+pub use memmap2;
+
 use bytes::Bytes;
 
 /// This is how the symbol file contents are returned. If there's an uncompressed file
