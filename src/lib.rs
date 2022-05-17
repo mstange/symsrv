@@ -26,12 +26,12 @@
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
 //! let symbol_cache = SymbolCache::new(symbol_path, false);
-//! 
+//!
 //! // Download and cache a PDB file.
 //! let relative_path: PathBuf =
 //!     ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
 //! let file_contents = symbol_cache.get_pdb(&relative_path).await?;
-//! 
+//!
 //! // Use the PDB file contents.
 //! use_pdb_bytes(&file_contents[..]);
 //! # Ok(())
