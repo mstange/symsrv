@@ -1,3 +1,6 @@
+[![crates.io page](https://img.shields.io/crates/v/symsrv.svg)](https://crates.io/crates/symsrv)
+[![docs.rs page](https://docs.rs/symsrv/badge.svg)](https://docs.rs/symsrv/)
+
 # symsrv
 
 This crate lets you download and cache pdb files from symbol servers, according to the rules from the `_NT_SYMBOL_PATH` environment variable.
