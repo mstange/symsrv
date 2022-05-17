@@ -3,7 +3,7 @@
 //! This crate lets you download and cache pdb files from symbol servers,
 //! according to the rules from the `_NT_SYMBOL_PATH` environment variable.
 //!
-//! It exposes an async API and uses of `reqwest` and `tokio::fs`.
+//! It exposes an async API and uses `reqwest` and `tokio::fs`.
 //!
 //! The downloaded symbols are stored and never evicted.
 //!
