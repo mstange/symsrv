@@ -171,12 +171,15 @@ pub fn parse_nt_symbol_path(
         .collect()
 }
 
+/// The error type used in this crate.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// There was an error when interacting with the file system.
     #[error("IO error: {0}")]
     IoError(#[source] std::io::Error),
 
+    /// The requested file was not found.
     #[error("The PDB was not found in the SymbolCache.")]
     NotFound,
 }
