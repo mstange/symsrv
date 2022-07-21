@@ -1,6 +1,6 @@
 //! # symsrv
 //!
-//! This crate lets you download and cache pdb files from symbol servers,
+//! This crate lets you download and cache symbol files from symbol servers,
 //! according to the rules from the `_NT_SYMBOL_PATH` environment variable.
 //!
 //! It exposes an async API and uses `reqwest` and `tokio::fs`.
@@ -30,7 +30,7 @@
 //! // Download and cache a PDB file.
 //! let relative_path: PathBuf =
 //!     ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
-//! let file_contents = symbol_cache.get_pdb(&relative_path).await?;
+//! let file_contents = symbol_cache.get_file(&relative_path).await?;
 //!
 //! // Use the PDB file contents.
 //! use_pdb_bytes(&file_contents[..]);
@@ -38,8 +38,8 @@
 //! # }
 //! ```
 
-use std::ffi::OsStr;
 use std::io::Cursor;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 /// A re-export of the `bytes` crate, because this crate uses the type `Bytes`
@@ -188,8 +188,16 @@ pub enum Error {
     IoError(#[source] std::io::Error),
 
     /// The requested file was not found.
-    #[error("The PDB was not found in the SymbolCache.")]
+    #[error("The file was not found in the SymbolCache.")]
     NotFound,
+
+    /// The requested path does not have a file extension.
+    #[error("The requested path does not have a file extension.")]
+    NoExtension,
+
+    /// The requested path does not have a recognized file extension.
+    #[error("The requested path does not have a recognized file extension (exe/dll/pdb/dbg).")]
+    UnrecognizedExtension,
 }
 
 impl From<std::io::Error> for Error {
@@ -219,8 +227,19 @@ impl SymbolCache {
     /// file according to the recipe of this `SymbolCache`. That means it searches
     /// cache directories, downloads symbols as needed, and uncompresses files
     /// as needed.
-    pub async fn get_pdb(&self, path: &Path) -> Result<FileContents, Error> {
-        match self.get_pdb_impl(path).await {
+    ///
+    /// The path should be a relative path to a symbol file. The file can be a PDB
+    /// file or a binary (exe / dll). The syntax of these paths is as follows:
+    ///
+    ///  - For PDBs: `<pdbName>\<GUID><age>\<pdbName>`, with `<GUID>` in uppercase
+    ///    and `<age>` in lowercase hex.
+    ///    Example: `xul.pdb\B2A2B092E45739B84C4C44205044422E1\xul.pdb`
+    ///  - For binaries: `<peName>\<TIMESTAMP><imageSize>\<peName>`, with `<TIMESTAMP>`
+    ///    printed as eight uppercase hex digits (with leading zeros added as needed)
+    ///    and `<imageSize>` in lowercase hex digits with as many digits as needed.
+    ///    Example: `renderdoc.dll\61015E74442b000\renderdoc.dll`
+    pub async fn get_file(&self, path: &Path) -> Result<FileContents, Error> {
+        match self.get_file_impl(path).await {
             Ok(file_contents) => {
                 if self.verbose {
                     eprintln!("Successfully obtained {:?} from the symbol cache.", path);
@@ -236,11 +255,9 @@ impl SymbolCache {
         }
     }
 
-    /// `path` should be a path of the form firefox.pdb\HEX\firefox.pdb
-    async fn get_pdb_impl(&self, rel_path_uncompressed: &Path) -> Result<FileContents, Error> {
-        assert!(rel_path_uncompressed.extension() == Some(OsStr::new("pdb")));
-        let mut rel_path_compressed = rel_path_uncompressed.to_owned();
-        rel_path_compressed.set_extension("pd_");
+    /// `path` should be a path of the form firefox.pdb\HEX\firefox.pdb or firefox.exe\HEX\firefox.exe.
+    async fn get_file_impl(&self, rel_path_uncompressed: &Path) -> Result<FileContents, Error> {
+        let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
 
         // The cache paths frome `cache*` entries, which apply to all subsequent
         // entries.
@@ -571,4 +588,24 @@ fn url_join(base_url: &str, components: std::path::Components) -> String {
             .collect::<Vec<_>>()
             .join("/")
     )
+}
+
+/// From a path to the uncompressed exe/dll/pdb file, create the path to the
+/// compressed file, by replacing the last char of the file extension with
+/// an underscore. These files are cab-compressed.
+fn create_compressed_path(uncompressed_path: &Path) -> Result<PathBuf, Error> {
+    let uncompressed_ext = match uncompressed_path.extension() {
+        Some(ext) => match ext.to_string_lossy().deref() {
+            "exe" => "ex_",
+            "dll" => "dl_",
+            "pdb" => "pd_",
+            "dbg" => "db_",
+            _ => return Err(Error::UnrecognizedExtension),
+        },
+        None => return Err(Error::NoExtension),
+    };
+
+    let mut compressed_path = uncompressed_path.to_owned();
+    compressed_path.set_extension(uncompressed_ext);
+    Ok(compressed_path)
 }
