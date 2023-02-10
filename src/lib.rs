@@ -242,13 +242,13 @@ impl SymbolCache {
         match self.get_file_impl(path).await {
             Ok(file_contents) => {
                 if self.verbose {
-                    eprintln!("Successfully obtained {:?} from the symbol cache.", path);
+                    eprintln!("Successfully obtained {path:?} from the symbol cache.");
                 }
                 Ok(file_contents)
             }
             Err(e) => {
                 if self.verbose {
-                    eprintln!("Encountered an error when trying to obtain {:?} from the symbol cache: {:?}", path, e);
+                    eprintln!("Encountered an error when trying to obtain {path:?} from the symbol cache: {e:?}");
                 }
                 Err(e)
             }
@@ -384,7 +384,7 @@ impl SymbolCache {
         rel_path_compressed: &Path,
     ) -> Result<Option<FileContents>, Error> {
         let full_candidate_path = dir.join(rel_path_uncompressed);
-        let full_candidate_path_compr = dir.join(&rel_path_compressed);
+        let full_candidate_path_compr = dir.join(rel_path_compressed);
 
         let (abs_path, is_compressed) = if self.check_file_exists(&full_candidate_path).await {
             (full_candidate_path, false)
@@ -453,13 +453,12 @@ impl SymbolCache {
                         .save_file_to_cache(&bytes[..], rel_path_compressed, one_mid_level_cache)
                         .await
                     {
-                        let _ = self
-                            .copy_file_to_caches(
-                                rel_path_compressed,
-                                &abs_compressed_path,
-                                other_mid_level_caches,
-                            )
-                            .await;
+                        self.copy_file_to_caches(
+                            rel_path_compressed,
+                            &abs_compressed_path,
+                            other_mid_level_caches,
+                        )
+                        .await;
                     }
                 }
                 let uncompressed_path = self
@@ -481,13 +480,12 @@ impl SymbolCache {
                     .save_file_to_cache(&bytes[..], rel_path_uncompressed, bottom_most_cache)
                     .await
                 {
-                    let _ = self
-                        .copy_file_to_caches(
-                            rel_path_uncompressed,
-                            &abs_compressed_path,
-                            mid_level_caches,
-                        )
-                        .await;
+                    self.copy_file_to_caches(
+                        rel_path_uncompressed,
+                        &abs_compressed_path,
+                        mid_level_caches,
+                    )
+                    .await;
                 }
             } else {
                 // No caching. Don't do anything.
@@ -532,7 +530,7 @@ impl SymbolCache {
 
         let mut cursor = Cursor::new(bytes);
         if self.verbose {
-            eprintln!("Saving bytes to {:?}.", dest_path);
+            eprintln!("Saving bytes to {dest_path:?}.");
         }
         let mut file = tokio::fs::File::create(&dest_path).await?;
         tokio::io::copy(&mut cursor, &mut file).await?;
@@ -560,7 +558,7 @@ impl SymbolCache {
             file.name().to_string()
         };
         if self.verbose {
-            eprintln!("Extracting {:?} into memory...", file_name_in_cab);
+            eprintln!("Extracting {file_name_in_cab:?} into memory...");
         }
         let mut reader = cabinet.read_file(&file_name_in_cab)?;
         let mut vec = Vec::new();
@@ -570,7 +568,7 @@ impl SymbolCache {
 
     async fn get_bytes_from_url(&self, url: &str) -> Option<Bytes> {
         if self.verbose {
-            eprintln!("Downloading {}...", url);
+            eprintln!("Downloading {url}...");
         }
         let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
         response.bytes().await.ok()
