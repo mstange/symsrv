@@ -255,7 +255,7 @@ impl SymbolCache {
         }
     }
 
-    /// `path` should be a path of the form firefox.pdb\HEX\firefox.pdb or firefox.exe\HEX\firefox.exe.
+    /// This is the implementation of `get_file`.
     async fn get_file_impl(&self, rel_path_uncompressed: &Path) -> Result<FileContents, Error> {
         let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
 
@@ -359,6 +359,7 @@ impl SymbolCache {
         Err(Error::NotFound)
     }
 
+    /// Return whether a file is found at `path`, and perform some logging if `self.verbose` is `true`.
     async fn check_file_exists(&self, path: &Path) -> bool {
         match tokio::fs::metadata(path).await {
             Ok(meta) if meta.is_file() => {
@@ -376,6 +377,11 @@ impl SymbolCache {
         }
     }
 
+    /// Attempt to find the file on the local file system. This is done first, before any downloading
+    /// is attempted. If a file is found, it is copied into the caches given by `parent_cache_paths`
+    /// and uncompressed if needed. On success, the bottom-most cache in `parent_cache_paths` (i.e.
+    /// the first entry) will always have the uncompressed file, and the other caches with have
+    /// whichever file was found in `dir`.
     async fn check_directory(
         &self,
         dir: &Path,
@@ -422,6 +428,20 @@ impl SymbolCache {
         })))
     }
 
+    /// Attempt to download a file from the given server. This tries both the compressed and
+    /// the non-compressed file. If successful, the file is stored in all the cache directories.
+    /// On success, the bottom cache always has the uncompressed file, and the other cache
+    /// directories have whichever file was downloaded from the server.
+    ///
+    /// The return value is either an mmap view into the uncompressed file in the bottom-most
+    /// cache, or, if no cache directories were given, a `Vec` of the uncompressed file bytes.
+    ///
+    /// Arguments:
+    ///
+    ///  - `url` is the base URL, to which the relative paths will be appended.
+    ///  - `parent_cache_paths` is the list of cache directories, starting with the bottom-most cache.
+    ///  - `rel_path_uncompressed` is the relative path to the uncompressed file.
+    ///  - `rel_path_compressed` is the relative path to the compressed file.
     async fn check_url(
         &self,
         url: &str,
@@ -495,6 +515,8 @@ impl SymbolCache {
         Ok(Some(file_contents))
     }
 
+    /// Copy the file at `abs_path` to the cache directories given by `caches`, using
+    /// `rel_path` to create the correct destination path for each cache.
     async fn copy_file_to_caches(&self, rel_path: &Path, abs_path: &Path, caches: &[PathBuf]) {
         for cache_path in caches {
             if let Ok(dest_path) = self
@@ -506,6 +528,9 @@ impl SymbolCache {
         }
     }
 
+    /// Given a relative file path and a cache directory path, concatenate the two to make
+    /// a destination path, and create the necessary directories so that a file can be stored
+    /// at the destination path.
     async fn make_dest_path_and_ensure_parent_dirs(
         &self,
         rel_path: &Path,
@@ -518,6 +543,7 @@ impl SymbolCache {
         Ok(dest_path)
     }
 
+    /// Saves `bytes` to a cache directory in the right place.
     async fn save_file_to_cache(
         &self,
         bytes: &[u8],
@@ -537,6 +563,8 @@ impl SymbolCache {
         Ok(dest_path)
     }
 
+    /// Uncompress the cab-compressed `bytes` and store the result in a cache
+    /// directory.
     async fn extract_to_file_in_cache(
         &self,
         bytes: &[u8],
@@ -548,6 +576,7 @@ impl SymbolCache {
             .await
     }
 
+    /// Uncompress the cab-compressed `bytes` into a `Vec` and return it.
     fn extract_into_memory(&self, bytes: &[u8]) -> Result<Vec<u8>, Error> {
         let cursor = Cursor::new(bytes);
         let mut cabinet = cab::Cabinet::new(cursor)?;
@@ -566,6 +595,7 @@ impl SymbolCache {
         Ok(vec)
     }
 
+    /// Download the file at `url` into memory.
     async fn get_bytes_from_url(&self, url: &str) -> Option<Bytes> {
         if self.verbose {
             eprintln!("Downloading {url}...");
