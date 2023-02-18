@@ -15,9 +15,9 @@
 //!
 //! ```
 //! use std::path::PathBuf;
-//! use symsrv::{get_symbol_path_from_environment, SymbolCache};
+//! use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymbolCache};
 //!
-//! # fn use_pdb_bytes(b: &[u8]) {}
+//! # fn open_pdb_at_path(p: &std::path::Path) {}
 //! #
 //! # async fn wrapper() -> Result<(), symsrv::Error> {
 //! // Parse the _NT_SYMBOL_PATH environment variable.
@@ -25,57 +25,25 @@
 //!     get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
-//! let symbol_cache = SymbolCache::new(symbol_path, false);
+//! let default_downstream = get_default_downstream_store(); // "~/sym"
+//! let symbol_cache = SymbolCache::new(symbol_path, default_downstream.as_deref(), false);
 //!
 //! // Download and cache a PDB file.
 //! let relative_path: PathBuf =
 //!     ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
-//! let file_contents = symbol_cache.get_file(&relative_path).await?;
+//! let local_path = symbol_cache.get_file(&relative_path).await?;
 //!
-//! // Use the PDB file contents.
-//! use_pdb_bytes(&file_contents[..]);
+//! // Use the PDB file.
+//! open_pdb_at_path(&local_path);
 //! # Ok(())
 //! # }
 //! ```
 
-use std::io::Cursor;
+use std::io::BufReader;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
-/// A re-export of the `bytes` crate, because this crate uses the type `Bytes`
-/// in its public API.
-pub use bytes;
-
-/// A re-export of the `memmap2` crate, because this crate uses the type `Mmap`
-/// in its public API.
-pub use memmap2;
-
-use bytes::Bytes;
-
-/// This is how the symbol file contents are returned. If there's an uncompressed file
-/// in the store, then we return an Mmap of that uncompressed file. If there is no
-/// local file or the local file is compressed, then we load or uncompress the file
-/// into memory and return a `Bytes` wrapper of that memory.
-///
-/// This type can be coerced to a [u8] slice with `&file_contents[..]`.
-pub enum FileContents {
-    /// A mapped file.
-    Mmap(memmap2::Mmap),
-    /// Bytes in memory.
-    Bytes(Bytes),
-}
-
-impl std::ops::Deref for FileContents {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        match self {
-            FileContents::Mmap(mmap) => mmap,
-            FileContents::Bytes(bytes) => bytes,
-        }
-    }
-}
+use tokio::io::AsyncWriteExt;
 
 /// The parsed representation of one entry in the (semicolon-separated list of entries in the) `_NT_SYMBOL_PATH` environment variable.
 /// The syntax of this string is documented at <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>.
@@ -92,7 +60,7 @@ pub enum NtSymbolPathEntry {
         /// Any cache directories. The first directory is the "bottom-most" cache, and is always
         // checked first, and always stores uncompressed files.
         /// Any remaining directories are mid-level cache directories. These can store compressed files.
-        cache_paths: Vec<PathBuf>,
+        cache_paths: Vec<CachePath>,
         /// Symbol server URLs. Can serve compressed or uncompressed files. Not used as a cache target.
         /// These are checked last.
         urls: Vec<String>,
@@ -100,6 +68,37 @@ pub enum NtSymbolPathEntry {
     /// A path where symbols can be found but which is not used as a cache target.
     /// Created for entries which are just a path.
     LocalOrShare(PathBuf),
+}
+
+/// A regular cache directory or a marker for the "default downstream store".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CachePath {
+    /// A placeholder for the directory of the "default downstream store". This is used
+    /// for empty cache items in the `_NT_SYMBOL_PATH`, e.g. if you have a `srv**URL` with
+    /// two asterisks right after each other.
+    DefaultDownstreamStore,
+
+    /// The path to a directory where this cache is located.
+    Path(PathBuf),
+}
+
+impl CachePath {
+    pub fn try_to_path<'a>(
+        &'a self,
+        default_downstream_store: Option<&'a Path>,
+    ) -> Option<&'a Path> {
+        match self {
+            CachePath::DefaultDownstreamStore => default_downstream_store,
+            CachePath::Path(path) => Some(path),
+        }
+    }
+
+    pub fn to_path<'a>(&'a self, default_downstream_store: &'a Path) -> &'a Path {
+        match self {
+            CachePath::DefaultDownstreamStore => default_downstream_store,
+            CachePath::Path(path) => path,
+        }
+    }
 }
 
 /// Currently returns ~/sym.
@@ -114,43 +113,35 @@ pub fn get_default_downstream_store() -> Option<PathBuf> {
     //
     // Let's ignore the part about the "debugger installation directory" and put the default
     // store at ~/sym.
-    dirs::home_dir().map(|home_dir| home_dir.join("sym"))
+    let home_dir = dirs::home_dir()?;
+    Some(home_dir.join("sym"))
 }
 
 /// Reads the `_NT_SYMBOL_PATH` environment variable and parses it.
 /// The parsed path entries use ~/sym as the default downstream store.
 pub fn get_symbol_path_from_environment(fallback_if_unset: &str) -> Vec<NtSymbolPathEntry> {
-    let default_downstream_store = get_default_downstream_store();
-    if let Ok(symbol_path) = std::env::var("_NT_SYMBOL_PATH") {
-        parse_nt_symbol_path(&symbol_path, default_downstream_store.as_deref())
-    } else {
-        parse_nt_symbol_path(fallback_if_unset, default_downstream_store.as_deref())
-    }
+    parse_nt_symbol_path(
+        std::env::var("_NT_SYMBOL_PATH")
+            .ok()
+            .as_deref()
+            .unwrap_or(fallback_if_unset),
+    )
 }
 
 /// Parse the value of the `_NT_SYMBOL_PATH` variable. The format of this variable
 /// is a semicolon-separated list of entries, where each entry is an asterisk-separated
 /// hierarchy of symbol locations which can be either directories or server URLs.
-pub fn parse_nt_symbol_path(
-    symbol_path: &str,
-    default_downstream_store: Option<&Path>,
-) -> Vec<NtSymbolPathEntry> {
-    fn chain<'a>(
-        dll_name: &str,
-        parts: impl Iterator<Item = &'a str>,
-        default_downstream_store: Option<&Path>,
-    ) -> NtSymbolPathEntry {
-        let mut cache_paths: Vec<PathBuf> = Vec::new();
-        let mut urls: Vec<String> = Vec::new();
+pub fn parse_nt_symbol_path(symbol_path: &str) -> Vec<NtSymbolPathEntry> {
+    fn chain<'a>(dll_name: &str, parts: impl Iterator<Item = &'a str>) -> NtSymbolPathEntry {
+        let mut cache_paths = Vec::new();
+        let mut urls = Vec::new();
         for part in parts {
             if part.is_empty() {
-                if let Some(default_downstream_store) = default_downstream_store {
-                    cache_paths.push(default_downstream_store.into());
-                }
+                cache_paths.push(CachePath::DefaultDownstreamStore);
             } else if part.starts_with("http://") || part.starts_with("https://") {
                 urls.push(part.into());
             } else {
-                cache_paths.push(part.into());
+                cache_paths.push(CachePath::Path(part.into()));
             }
         }
         NtSymbolPathEntry::Chain {
@@ -169,10 +160,8 @@ pub fn parse_nt_symbol_path(
                 "cache" => parts
                     .next()
                     .map(|path| NtSymbolPathEntry::Cache(path.into())),
-                "srv" => Some(chain("symsrv.dll", parts, default_downstream_store)),
-                "symsrv" => parts
-                    .next()
-                    .map(|dll_name| chain(dll_name, parts, default_downstream_store)),
+                "srv" => Some(chain("symsrv.dll", parts)),
+                "symsrv" => parts.next().map(|dll_name| chain(dll_name, parts)),
                 _ => Some(NtSymbolPathEntry::LocalOrShare(first.into())),
             }
         })
@@ -191,6 +180,10 @@ pub enum Error {
     #[error("The file was not found in the SymbolCache.")]
     NotFound,
 
+    /// No default downstream store was specified, but it was needed.
+    #[error("No default downstream store was specified, but it was needed.")]
+    NoDefaultDownstreamStore,
+
     /// The requested path does not have a file extension.
     #[error("The requested path does not have a file extension.")]
     NoExtension,
@@ -198,6 +191,14 @@ pub enum Error {
     /// The requested path does not have a recognized file extension.
     #[error("The requested path does not have a recognized file extension (exe/dll/pdb/dbg).")]
     UnrecognizedExtension,
+
+    /// An internal error occurred: Couldn't join task
+    #[error("An internal error occurred: Couldn't join task")]
+    JoinError(#[from] tokio::task::JoinError),
+
+    /// Generic error from `reqwest`.
+    #[error("ReqwestError: {0}")]
+    ReqwestError(#[from] reqwest::Error),
 }
 
 impl From<std::io::Error> for Error {
@@ -210,15 +211,21 @@ impl From<std::io::Error> for Error {
 pub struct SymbolCache {
     symbol_path: Vec<NtSymbolPathEntry>,
     verbose: bool,
+    default_downstream_store: Option<PathBuf>,
 }
 
 impl SymbolCache {
     /// Create a new `SymbolCache`. If `verbose` is set to `true`, log messages
     /// will be printed to stderr.
-    pub fn new(symbol_path: Vec<NtSymbolPathEntry>, verbose: bool) -> Self {
+    pub fn new(
+        symbol_path: Vec<NtSymbolPathEntry>,
+        default_downstream_store: Option<&Path>,
+        verbose: bool,
+    ) -> Self {
         Self {
             symbol_path,
             verbose,
+            default_downstream_store: default_downstream_store.map(ToOwned::to_owned),
         }
     }
 
@@ -227,6 +234,9 @@ impl SymbolCache {
     /// file according to the recipe of this `SymbolCache`. That means it searches
     /// cache directories, downloads symbols as needed, and uncompresses files
     /// as needed.
+    ///
+    /// If a matching file is found, a `PathBuf` to the uncompressed file on the local
+    /// file system is returned.
     ///
     /// The path should be a relative path to a symbol file. The file can be a PDB
     /// file or a binary (exe / dll). The syntax of these paths is as follows:
@@ -238,7 +248,7 @@ impl SymbolCache {
     ///    printed as eight uppercase hex digits (with leading zeros added as needed)
     ///    and `<imageSize>` in lowercase hex digits with as many digits as needed.
     ///    Example: `renderdoc.dll\61015E74442b000\renderdoc.dll`
-    pub async fn get_file(&self, path: &Path) -> Result<FileContents, Error> {
+    pub async fn get_file(&self, path: &Path) -> Result<PathBuf, Error> {
         match self.get_file_impl(path).await {
             Ok(file_contents) => {
                 if self.verbose {
@@ -256,39 +266,39 @@ impl SymbolCache {
     }
 
     /// This is the implementation of `get_file`.
-    async fn get_file_impl(&self, rel_path_uncompressed: &Path) -> Result<FileContents, Error> {
+    async fn get_file_impl(&self, rel_path_uncompressed: &Path) -> Result<PathBuf, Error> {
         let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
 
         // The cache paths frome `cache*` entries, which apply to all subsequent
         // entries.
-        let mut persisted_cache_paths: Vec<PathBuf> = Vec::new();
+        let mut persisted_cache_paths: Vec<CachePath> = Vec::new();
 
         // Iterate all entries in the symbol path, checking them for matches one by one.
         for entry in &self.symbol_path {
             match entry {
-                NtSymbolPathEntry::Cache(cache_path) => {
-                    if persisted_cache_paths.contains(cache_path) {
+                NtSymbolPathEntry::Cache(cache_dir) => {
+                    let cache_path = CachePath::Path(cache_dir.into());
+                    if persisted_cache_paths.contains(&cache_path) {
                         continue;
                     }
 
-                    // Add this path to `persisted_cache_paths` so that any matches in the
-                    // upcoming entries can be persisted to this cache.
-                    persisted_cache_paths.push(cache_path.clone());
-
                     // Check if the symbol file is present in this cache. If found, also persist
                     // it to the previous cache paths.
-                    let (_, parent_cache_paths) = persisted_cache_paths.split_last().unwrap();
-                    if let Some(file_contents) = self
+                    if let Some(found_path) = self
                         .check_directory(
-                            cache_path,
-                            parent_cache_paths,
+                            cache_dir,
+                            &persisted_cache_paths,
                             rel_path_uncompressed,
                             &rel_path_compressed,
                         )
                         .await?
                     {
-                        return Ok(file_contents);
-                    };
+                        return Ok(found_path);
+                    }
+
+                    // Add this path to `persisted_cache_paths` so that any matches in the
+                    // upcoming entries can be persisted to this cache.
+                    persisted_cache_paths.push(cache_path);
                 }
                 NtSymbolPathEntry::Chain {
                     cache_paths, urls, ..
@@ -306,23 +316,27 @@ impl SymbolCache {
                         // Check if the symbol file is present at this path. If found, also persist
                         // it to the previous cache paths.
                         let (_, parent_cache_paths) = parent_cache_paths.split_last().unwrap();
-                        if let Some(file_contents) = self
-                            .check_directory(
-                                cache_path,
-                                parent_cache_paths,
-                                rel_path_uncompressed,
-                                &rel_path_compressed,
-                            )
-                            .await?
+                        if let Some(cache_dir) =
+                            cache_path.try_to_path(self.default_downstream_store.as_deref())
                         {
-                            return Ok(file_contents);
-                        };
+                            if let Some(found_path) = self
+                                .check_directory(
+                                    cache_dir,
+                                    parent_cache_paths,
+                                    rel_path_uncompressed,
+                                    &rel_path_compressed,
+                                )
+                                .await?
+                            {
+                                return Ok(found_path);
+                            }
+                        }
                     }
 
                     // Download the symbol file from the URL(s) in this entry. If found, also persist
                     // the file to the previous cache paths.
                     for url in urls {
-                        if let Some(file_contents) = self
+                        if let Some(found_path) = self
                             .check_url(
                                 url,
                                 &parent_cache_paths,
@@ -331,18 +345,18 @@ impl SymbolCache {
                             )
                             .await?
                         {
-                            return Ok(file_contents);
+                            return Ok(found_path);
                         }
                     }
                 }
                 NtSymbolPathEntry::LocalOrShare(dir_path) => {
-                    if persisted_cache_paths.contains(dir_path) {
+                    if persisted_cache_paths.contains(&CachePath::Path(dir_path.into())) {
                         continue;
                     }
 
                     // Check if the symbol file is present at this path. If found, also persist
                     // it to the previous cache paths.
-                    if let Some(file_contents) = self
+                    if let Some(found_path) = self
                         .check_directory(
                             dir_path,
                             &persisted_cache_paths,
@@ -351,7 +365,7 @@ impl SymbolCache {
                         )
                         .await?
                     {
-                        return Ok(file_contents);
+                        return Ok(found_path);
                     };
                 }
             }
@@ -385,10 +399,10 @@ impl SymbolCache {
     async fn check_directory(
         &self,
         dir: &Path,
-        parent_cache_paths: &[PathBuf],
+        parent_cache_paths: &[CachePath],
         rel_path_uncompressed: &Path,
         rel_path_compressed: &Path,
-    ) -> Result<Option<FileContents>, Error> {
+    ) -> Result<Option<PathBuf>, Error> {
         let full_candidate_path = dir.join(rel_path_uncompressed);
         let full_candidate_path_compr = dir.join(rel_path_compressed);
 
@@ -403,29 +417,28 @@ impl SymbolCache {
         // We found a file. Yay!
 
         let uncompressed_path = if is_compressed {
-            let file = tokio::fs::File::open(&abs_path).await?;
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
                 // We have at least one cache, and the file is compressed.
                 // Copy the compressed file to the mid-level caches, and uncompress the file
                 // into the bottom-most cache.
                 self.copy_file_to_caches(rel_path_compressed, &abs_path, mid_level_caches)
                     .await;
-                self.extract_to_file_in_cache(&mmap[..], rel_path_uncompressed, bottom_most_cache)
+                self.extract_to_file_in_cache(&abs_path, rel_path_uncompressed, bottom_most_cache)
                     .await?
             } else {
-                // We have no cache. Extract it into memory.
-                let vec = self.extract_into_memory(&mmap[..])?;
-                return Ok(Some(FileContents::Bytes(Bytes::from(vec))));
+                // We have no cache. Extract it into the default downstream cache.
+                self.extract_to_file_in_cache(
+                    &abs_path,
+                    rel_path_uncompressed,
+                    &CachePath::DefaultDownstreamStore,
+                )
+                .await?
             }
         } else {
             abs_path
         };
 
-        let file = tokio::fs::File::open(&uncompressed_path).await?;
-        Ok(Some(FileContents::Mmap(unsafe {
-            memmap2::MmapOptions::new().map(&file)?
-        })))
+        Ok(Some(uncompressed_path))
     }
 
     /// Attempt to download a file from the given server. This tries both the compressed and
@@ -445,85 +458,84 @@ impl SymbolCache {
     async fn check_url(
         &self,
         url: &str,
-        parent_cache_paths: &[PathBuf],
+        parent_caches: &[CachePath],
         rel_path_uncompressed: &Path,
         rel_path_compressed: &Path,
-    ) -> Result<Option<FileContents>, Error> {
+    ) -> Result<Option<PathBuf>, Error> {
         let full_candidate_url = url_join(url, rel_path_uncompressed.components());
         let full_candidate_url_compr = url_join(url, rel_path_compressed.components());
-        let (bytes, is_compressed) = match self.get_bytes_from_url(&full_candidate_url_compr).await
+        let (download_dest_cache, remaining_caches) = parent_caches
+            .split_last()
+            .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
+        let (dest_path, is_compressed) = match self
+            .download_file_to_cache(
+                &full_candidate_url_compr,
+                rel_path_compressed,
+                download_dest_cache,
+            )
+            .await
         {
-            Some(bytes) => (bytes, true),
-            None => match self.get_bytes_from_url(&full_candidate_url).await {
-                Some(bytes) => (bytes, false),
-                None => return Ok(None),
+            Ok(dest_path) => (dest_path, true),
+            Err(_) => match self
+                .download_file_to_cache(
+                    &full_candidate_url,
+                    rel_path_uncompressed,
+                    download_dest_cache,
+                )
+                .await
+            {
+                Ok(dest_path) => (dest_path, false),
+                Err(_) => return Ok(None),
             },
         };
 
         // We have a file!
-        let file_contents = if is_compressed {
-            if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
+        let uncompressed_dest_path = if is_compressed {
+            if let Some((bottom_most_cache, remaining_mid_level_caches)) =
+                remaining_caches.split_first()
+            {
                 // We have at least one cache, and the file is compressed.
                 // Save the compressed file to the mid-level caches, and uncompress the file
                 // into the bottom-most cache.
-                if let Some((one_mid_level_cache, other_mid_level_caches)) =
-                    mid_level_caches.split_first()
-                {
-                    if let Ok(abs_compressed_path) = self
-                        .save_file_to_cache(&bytes[..], rel_path_compressed, one_mid_level_cache)
-                        .await
-                    {
-                        self.copy_file_to_caches(
-                            rel_path_compressed,
-                            &abs_compressed_path,
-                            other_mid_level_caches,
-                        )
-                        .await;
-                    }
-                }
-                let uncompressed_path = self
-                    .extract_to_file_in_cache(&bytes[..], rel_path_uncompressed, bottom_most_cache)
-                    .await?;
-                let file = tokio::fs::File::open(&uncompressed_path).await?;
-                FileContents::Mmap(unsafe { memmap2::MmapOptions::new().map(&file)? })
+                self.copy_file_to_caches(
+                    rel_path_compressed,
+                    &dest_path,
+                    remaining_mid_level_caches,
+                )
+                .await;
+                self.extract_to_file_in_cache(&dest_path, rel_path_uncompressed, bottom_most_cache)
+                    .await?
             } else {
-                // We have no cache. Extract the bytes into memory.
-                let vec = self.extract_into_memory(&bytes[..])?;
-                FileContents::Bytes(Bytes::from(vec))
+                // We have no cache. Extract the file into the default downstream cache, if available.
+                self.extract_to_file_in_cache(
+                    &dest_path,
+                    rel_path_uncompressed,
+                    &CachePath::DefaultDownstreamStore,
+                )
+                .await?
             }
         } else {
-            // The file is not compressed. Just store.
-            if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
-                // We have at least one cache, and the file is NOT compressed.
-                // Save the file to the bottom-most cache, and copy it into the mid-level caches.
-                if let Ok(abs_compressed_path) = self
-                    .save_file_to_cache(&bytes[..], rel_path_uncompressed, bottom_most_cache)
-                    .await
-                {
-                    self.copy_file_to_caches(
-                        rel_path_uncompressed,
-                        &abs_compressed_path,
-                        mid_level_caches,
-                    )
-                    .await;
-                }
-            } else {
-                // No caching. Don't do anything.
-            }
-            FileContents::Bytes(bytes)
+            // The file is not compressed. Just copy to the other caches.
+            self.copy_file_to_caches(rel_path_uncompressed, &dest_path, remaining_caches)
+                .await;
+            dest_path
         };
-        Ok(Some(file_contents))
+        Ok(Some(uncompressed_dest_path))
     }
 
     /// Copy the file at `abs_path` to the cache directories given by `caches`, using
     /// `rel_path` to create the correct destination path for each cache.
-    async fn copy_file_to_caches(&self, rel_path: &Path, abs_path: &Path, caches: &[PathBuf]) {
+    async fn copy_file_to_caches(&self, rel_path: &Path, abs_path: &Path, caches: &[CachePath]) {
         for cache_path in caches {
-            if let Ok(dest_path) = self
-                .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
-                .await
+            if let Some(cache_dir) =
+                cache_path.try_to_path(self.default_downstream_store.as_deref())
             {
-                let _ = tokio::fs::copy(&abs_path, &dest_path).await;
+                if let Ok(dest_path) = self
+                    .make_dest_path_and_ensure_parent_dirs(rel_path, cache_dir)
+                    .await
+                {
+                    let _ = tokio::fs::copy(&abs_path, &dest_path).await;
+                }
             }
         }
     }
@@ -543,65 +555,79 @@ impl SymbolCache {
         Ok(dest_path)
     }
 
-    /// Saves `bytes` to a cache directory in the right place.
-    async fn save_file_to_cache(
-        &self,
-        bytes: &[u8],
-        rel_path: &Path,
-        cache_path: &Path,
-    ) -> Result<PathBuf, Error> {
-        let dest_path = self
-            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
-            .await?;
-
-        let mut cursor = Cursor::new(bytes);
-        if self.verbose {
-            eprintln!("Saving bytes to {dest_path:?}.");
-        }
-        let mut file = tokio::fs::File::create(&dest_path).await?;
-        tokio::io::copy(&mut cursor, &mut file).await?;
-        Ok(dest_path)
-    }
-
     /// Uncompress the cab-compressed `bytes` and store the result in a cache
     /// directory.
     async fn extract_to_file_in_cache(
         &self,
-        bytes: &[u8],
+        compressed_input_path: &Path,
         rel_path: &Path,
-        cache_path: &Path,
+        cache_path: &CachePath,
     ) -> Result<PathBuf, Error> {
-        let extracted_bytes = self.extract_into_memory(bytes)?;
-        self.save_file_to_cache(&extracted_bytes, rel_path, cache_path)
-            .await
-    }
+        let cache_path = cache_path
+            .try_to_path(self.default_downstream_store.as_deref())
+            .ok_or(Error::NoDefaultDownstreamStore)?;
+        let dest_path = self
+            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
+            .await?;
+        let compressed_input_path = compressed_input_path.to_owned();
+        let verbose = self.verbose;
+        let x = tokio::spawn(async move {
+            let file = std::fs::File::open(&compressed_input_path)?;
+            let buf_read = BufReader::new(file);
 
-    /// Uncompress the cab-compressed `bytes` into a `Vec` and return it.
-    fn extract_into_memory(&self, bytes: &[u8]) -> Result<Vec<u8>, Error> {
-        let cursor = Cursor::new(bytes);
-        let mut cabinet = cab::Cabinet::new(cursor)?;
-        let file_name_in_cab = {
-            // Only pick the first file we encounter. That's the PDB.
-            let folder = cabinet.folder_entries().next().unwrap();
-            let file = folder.file_entries().next().unwrap();
-            file.name().to_string()
-        };
-        if self.verbose {
-            eprintln!("Extracting {file_name_in_cab:?} into memory...");
-        }
-        let mut reader = cabinet.read_file(&file_name_in_cab)?;
-        let mut vec = Vec::new();
-        std::io::copy(&mut reader, &mut vec)?;
-        Ok(vec)
+            let mut cabinet = cab::Cabinet::new(buf_read)?;
+            let file_name_in_cab = {
+                // Only pick the first file we encounter. That's the PDB.
+                let folder = cabinet.folder_entries().next().unwrap();
+                let file = folder.file_entries().next().unwrap();
+                file.name().to_string()
+            };
+            if verbose {
+                eprintln!("Extracting {file_name_in_cab:?} from cab file {compressed_input_path:?} to file {dest_path:?}...");
+            }
+            let mut reader = cabinet.read_file(&file_name_in_cab)?;
+            let mut dest_file = std::fs::File::create(&dest_path)?;
+            std::io::copy(&mut reader, &mut dest_file)?;
+            Ok(dest_path)
+        }).await?;
+        x
     }
 
     /// Download the file at `url` into memory.
-    async fn get_bytes_from_url(&self, url: &str) -> Option<Bytes> {
+    async fn download_file_to_cache(
+        &self,
+        url: &str,
+        rel_path: &Path,
+        cache: &CachePath,
+    ) -> Result<PathBuf, Error> {
+        let cache_path = cache
+            .try_to_path(self.default_downstream_store.as_deref())
+            .ok_or(Error::NoDefaultDownstreamStore)?;
         if self.verbose {
-            eprintln!("Downloading {url}...");
+            eprintln!("Checking URL {url}...");
         }
-        let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
-        response.bytes().await.ok()
+        let response = reqwest::get(url).await?.error_for_status()?;
+
+        // We have a response with a success error code.
+        let dest_path = self
+            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
+            .await?;
+        if self.verbose {
+            eprintln!("Downloading file from {url} to {dest_path:?}...");
+        }
+
+        let mut stream = response.bytes_stream();
+
+        let file = tokio::fs::File::create(&dest_path).await?;
+        let mut writer = tokio::io::BufWriter::new(file);
+        use futures_util::StreamExt;
+        while let Some(item) = stream.next().await {
+            let item = item?;
+            let mut item_slice = item.as_ref();
+            tokio::io::copy(&mut item_slice, &mut writer).await?;
+        }
+        writer.flush().await?;
+        Ok(dest_path)
     }
 }
 

@@ -17,22 +17,23 @@ The downloaded symbols are stored and never evicted.
 
 ```rust
 use std::path::PathBuf;
-use symsrv::{get_symbol_path_from_environment, SymbolCache};
+use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymbolCache};
 
 // Parse the _NT_SYMBOL_PATH environment variable.
 let symbol_path =
     get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
 
 // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
-let symbol_cache = SymbolCache::new(symbol_path, false);
+let default_downstream = get_default_downstream_store(); // "~/sym"
+let symbol_cache = SymbolCache::new(symbol_path, default_downstream.as_deref(), false);
 
 // Download and cache a PDB file.
 let relative_path: PathBuf =
     ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
-let file_contents = symbol_cache.get_file(&relative_path).await?;
+let local_path = symbol_cache.get_file(&relative_path).await?;
 
-// Use the PDB file contents.
-use_pdb_bytes(&file_contents[..]);
+// Use the PDB file.
+open_pdb_at_path(&local_path);
 ```
 
 ## License

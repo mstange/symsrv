@@ -1,7 +1,7 @@
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 
-use symsrv::{NtSymbolPathEntry, SymbolCache};
+use symsrv::{CachePath, NtSymbolPathEntry, SymbolCache};
 use tempfile::tempdir;
 
 fn fixtures_dir() -> PathBuf {
@@ -13,6 +13,12 @@ fn path_to_fixture(rel_path: impl AsRef<Path>) -> PathBuf {
     let mut path = fixtures_dir();
     path.push(rel_path);
     path
+}
+
+fn file_matches_fixture(test_path: &Path, fixture_rel_path: impl AsRef<Path>) -> bool {
+    let test_file_bytes = std::fs::read(test_path).unwrap();
+    let ref_file_bytes = std::fs::read(path_to_fixture(fixture_rel_path)).unwrap();
+    test_file_bytes == ref_file_bytes
 }
 
 struct TestCacheDir {
@@ -37,6 +43,10 @@ impl TestCacheDir {
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    pub fn cache_path(&self) -> CachePath {
+        CachePath::Path(self.path().into())
     }
 
     pub fn path_for_file(&self, rel_path: impl AsRef<Path>) -> PathBuf {
@@ -81,13 +91,15 @@ impl TestSymbolServer {
 
 #[tokio::test]
 async fn test_nothing_available() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
     let cache1 = TestCacheDir::prepare(&[]).unwrap();
     let symbol_cache = SymbolCache::new(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
-            cache_paths: vec![cache1.path().to_owned()],
+            cache_paths: vec![cache1.cache_path()],
             urls: vec![],
         }],
+        Some(default_downstream.path()),
         false,
     );
     let res = symbol_cache
@@ -103,14 +115,16 @@ async fn test_nothing_available() {
 
 #[tokio::test]
 async fn test_simple_available() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
     let cache1 =
         TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).unwrap();
     let symbol_cache = SymbolCache::new(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
-            cache_paths: vec![cache1.path().to_owned()],
+            cache_paths: vec![cache1.cache_path()],
             urls: vec![],
         }],
+        Some(default_downstream.path()),
         false,
     );
     let res = symbol_cache
@@ -119,22 +133,25 @@ async fn test_simple_available() {
         ))
         .await;
     assert!(
-        matches!(res, Ok(_contents) if _contents.len() > 0),
+        matches!(res, Ok(path) if file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")),
         "Should find a symbol file in a pre-populated cache"
     );
 }
 
 #[tokio::test]
 async fn test_simple_compressed() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
     // The cache starts out with the compressed .ex_ file.
     let cache1 =
         TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"]).unwrap();
     let symbol_cache = SymbolCache::new(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
-            cache_paths: vec![cache1.path().to_owned()],
+            cache_paths: vec![cache1.cache_path()],
             urls: vec![],
         }],
+        Some(default_downstream.path()),
         false,
     );
     let res = symbol_cache
@@ -147,22 +164,26 @@ async fn test_simple_compressed() {
         "Should find an uncompressed symbol file in a cache with the compressed file"
     );
     assert!(
-        !cache1.contains_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"
-        )),
+        !cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should be NOT stored in the cache which the file was found in."
     );
-    // TODO: The Microsoft docs say that in this case, the uncompressed file should be stored
-    // in the "default downstream store". We don't currently do that.
+    // The Microsoft docs say that in this case, the uncompressed file should be stored
+    // in the "default downstream store".
     //
     // > Note: If you are accessing symbols from an HTTP or HTTPS site, or if the symbol store
     // > uses compressed files, a downstream store is always used. If no downstream store is
     // > specified, one will be created in the sym subdirectory of the home directory.
     // https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use
+    assert!(
+        default_downstream.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The uncompressed file should be stored in the default downstream store."
+    );
 }
 
 #[tokio::test]
 async fn test_propagate_compressed() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
     // The cache starts out with the compressed .ex_ file.
     let cache1 = TestCacheDir::prepare(&[]).unwrap();
     let cache2 =
@@ -170,9 +191,10 @@ async fn test_propagate_compressed() {
     let symbol_cache = SymbolCache::new(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
-            cache_paths: vec![cache1.path().to_owned(), cache2.path().to_owned()],
+            cache_paths: vec![cache1.cache_path(), cache2.cache_path()],
             urls: vec![],
         }],
+        Some(default_downstream.path()),
         false,
     );
     let res = symbol_cache
@@ -181,20 +203,20 @@ async fn test_propagate_compressed() {
         ))
         .await;
     assert!(
-        matches!(res, Ok(_)),
+        matches!(res, Ok(path) if file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")),
         "Should find an uncompressed symbol file in a cache with the compressed file"
     );
 
     assert!(
-        cache1.contains_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"
-        )),
+        cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should be stored in the parent cache."
     );
 }
 
 #[tokio::test]
 async fn test_simple_server() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
     // The cache starts out empty.
     let cache1 = TestCacheDir::prepare(&[]).unwrap();
 
@@ -205,9 +227,10 @@ async fn test_simple_server() {
     let symbol_cache = SymbolCache::new(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
-            cache_paths: vec![cache1.path().to_owned()],
+            cache_paths: vec![cache1.cache_path()],
             urls: vec![server1.url()],
         }],
+        Some(default_downstream.path()),
         false,
     );
     let res = symbol_cache
@@ -220,9 +243,7 @@ async fn test_simple_server() {
         "Should find an uncompressed symbol file by downloading the uncompressed file"
     );
     assert!(
-        cache1.contains_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"
-        )),
+        cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should be stored in the cache."
     );
 }
