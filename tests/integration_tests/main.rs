@@ -248,6 +248,53 @@ async fn test_simple_server() {
     );
 }
 
+#[tokio::test]
+async fn test_server_with_cab_compression() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
+    // The cache starts out empty.
+    let cache1 = TestCacheDir::prepare(&[]).unwrap();
+
+    // The server has a single, uncompressed, file.
+    let server1 =
+        TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"]).await;
+
+    let symbol_cache = SymbolCache::new(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+        false,
+    );
+    let res = symbol_cache
+        .get_file(Path::new(
+            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        ))
+        .await;
+    assert!(
+        matches!(res, Ok(_)),
+        "Should find an uncompressed symbol file by downloading the uncompressed file"
+    );
+    assert!(
+        cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"),
+        "The compressed file should be stored in the cache."
+    );
+    assert!(
+        cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The uncompressed file should be stored in the cache."
+    );
+    assert!(
+        !default_downstream.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"),
+        "The uncompressed file should NOT be stored in the default downstream store."
+    );
+    assert!(
+        !default_downstream.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The uncompressed file should NOT be stored in the default downstream store."
+    );
+}
+
 // Tests to add:
 //  - Tests with multiple servers, falling back on 404 and other error responses
 //  - Tests for `NtSymbolPathEntry::Cache`: make sure things are propagated into that cache for

@@ -491,29 +491,22 @@ impl SymbolCache {
 
         // We have a file!
         let uncompressed_dest_path = if is_compressed {
-            if let Some((bottom_most_cache, remaining_mid_level_caches)) =
+            if let Some((_remaining_bottom_cache, remaining_mid_level_caches)) =
                 remaining_caches.split_first()
             {
-                // We have at least one cache, and the file is compressed.
-                // Save the compressed file to the mid-level caches, and uncompress the file
-                // into the bottom-most cache.
+                // Save the compressed file to the mid-level caches.
                 self.copy_file_to_caches(
                     rel_path_compressed,
                     &dest_path,
                     remaining_mid_level_caches,
                 )
                 .await;
-                self.extract_to_file_in_cache(&dest_path, rel_path_uncompressed, bottom_most_cache)
-                    .await?
-            } else {
-                // We have no cache. Extract the file into the default downstream cache, if available.
-                self.extract_to_file_in_cache(
-                    &dest_path,
-                    rel_path_uncompressed,
-                    &CachePath::DefaultDownstreamStore,
-                )
-                .await?
             }
+            let bottom_cache = parent_caches
+                .first()
+                .unwrap_or(&CachePath::DefaultDownstreamStore);
+            self.extract_to_file_in_cache(&dest_path, rel_path_uncompressed, bottom_cache)
+                .await?
         } else {
             // The file is not compressed. Just copy to the other caches.
             self.copy_file_to_caches(rel_path_uncompressed, &dest_path, remaining_caches)
