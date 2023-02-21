@@ -502,6 +502,7 @@ impl SymbolCache {
                 )
                 .await;
             }
+            // Extract the file into the bottom cache.
             let bottom_cache = parent_caches
                 .first()
                 .unwrap_or(&CachePath::DefaultDownstreamStore);
