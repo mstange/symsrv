@@ -26,7 +26,7 @@
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
 //! let default_downstream = get_default_downstream_store(); // "~/sym"
-//! let symbol_cache = SymbolCache::new(symbol_path, default_downstream.as_deref(), false);
+//! let symbol_cache = SymbolCache::new(symbol_path, default_downstream.as_deref(), None);
 //!
 //! // Download and cache a PDB file.
 //! let relative_path: PathBuf =
@@ -39,14 +39,22 @@
 //! # }
 //! ```
 
+mod download;
 mod file_creation;
 
 use std::io::BufReader;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use std::time::Duration;
 
+use async_compat::CompatExt;
 use file_creation::{create_file_cleanly, CleanFileCreationError};
 use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
+
+use crate::download::response_to_uncompressed_stream_with_progress;
 
 /// The parsed representation of one entry in the (semicolon-separated list of entries in the) `_NT_SYMBOL_PATH` environment variable.
 /// The syntax of this string is documented at <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>.
@@ -202,6 +210,10 @@ pub enum Error {
     /// Generic error from `reqwest`.
     #[error("ReqwestError: {0}")]
     ReqwestError(#[from] reqwest::Error),
+
+    /// Unexpected Content-Encoding header.
+    #[error("Unexpected Content-Encoding header: {0}")]
+    UnexpectedContentEncoding(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -219,25 +231,117 @@ impl From<CleanFileCreationError<Error>> for Error {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum DownloadError {
+    #[error("Opening the request failed")]
+    OpenFailed,
+
+    #[error("The download timed out")]
+    Timeout,
+
+    #[error("The server returned status code {0}")]
+    StatusError(http::StatusCode),
+
+    #[error("The destination directory could not be created")]
+    CouldNotCreateDestinationDirectory,
+
+    #[error("The response used an unexpected Content-Encoding: {0}")]
+    UnexpectedContentEncoding(String),
+
+    #[error("The download was cancelled by dropping the future")]
+    FutureDropped,
+
+    #[error("Error during downloading: {0}")]
+    ErrorDuringDownloading(std::io::Error),
+
+    #[error("Error while writing the downloaded file: {0}")]
+    ErrorWhileWritingDownloadedFile(std::io::Error),
+
+    #[error("Redirect-related error")]
+    Redirect(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Other error: {0}")]
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[cfg(test)]
+#[test]
+fn test_download_error_is_sync() {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<DownloadError>();
+}
+
+impl From<reqwest::Error> for DownloadError {
+    fn from(e: reqwest::Error) -> Self {
+        if e.is_status() {
+            DownloadError::StatusError(e.status().unwrap())
+        } else if e.is_request() {
+            DownloadError::OpenFailed
+        } else if e.is_redirect() {
+            DownloadError::Redirect(e.into())
+        } else if e.is_timeout() {
+            DownloadError::Timeout
+        } else {
+            DownloadError::Other(e.into())
+        }
+    }
+}
+
+pub trait SymbolCacheObserver {
+    fn on_new_download_before_connect(&self, download_id: u64, url: &str);
+    fn on_download_started(&self, download_id: u64);
+    fn on_download_progress(&self, download_id: u64, bytes_so_far: u64, total_bytes: Option<u64>);
+    fn on_download_completed(
+        &self,
+        download_id: u64,
+        uncompressed_size_in_bytes: u64,
+        time_until_headers: Duration,
+        time_until_completed: Duration,
+    );
+    fn on_download_failed(&self, download_id: u64, reason: DownloadError);
+    fn on_file_created(&self, path: &Path, size_in_bytes: u64);
+    fn on_file_accessed(&self, path: &Path);
+    fn on_file_missed(&self, path: &Path);
+}
+
+static NEXT_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Obtains symbols according to the instructions in the symbol path.
 pub struct SymbolCache {
     symbol_path: Vec<NtSymbolPathEntry>,
-    verbose: bool,
     default_downstream_store: Option<PathBuf>,
+    observer: Option<Arc<dyn SymbolCacheObserver>>,
+    client: reqwest::Client,
 }
 
 impl SymbolCache {
-    /// Create a new `SymbolCache`. If `verbose` is set to `true`, log messages
-    /// will be printed to stderr.
+    /// Create a new `SymbolCache`.
     pub fn new(
         symbol_path: Vec<NtSymbolPathEntry>,
         default_downstream_store: Option<&Path>,
-        verbose: bool,
+        observer: Option<Arc<dyn SymbolCacheObserver>>,
     ) -> Self {
+        let builder = reqwest::Client::builder();
+
+        // Turn off HTTP 2, in order to work around https://github.com/seanmonstar/reqwest/issues/1761 .
+        let builder = builder.http1_only();
+
+        // Turn off automatic decompression because it doesn't allow us to compute
+        // download progress percentages: we'd only know the decompressed current
+        // size and the compressed total size.
+        // Instead, we do the streaming decompression manually, see download.rs.
+        let builder = builder.no_gzip().no_brotli().no_deflate();
+
+        // Create the client.
+        // TODO: Add timeouts, user agent, maybe other settings
+        // TODO: Propagate error
+        let client = builder.build().unwrap();
+
         Self {
             symbol_path,
-            verbose,
             default_downstream_store: default_downstream_store.map(ToOwned::to_owned),
+            observer,
+            client,
         }
     }
 
@@ -261,24 +365,7 @@ impl SymbolCache {
     ///    and `<imageSize>` in lowercase hex digits with as many digits as needed.
     ///    Example: `renderdoc.dll\61015E74442b000\renderdoc.dll`
     pub async fn get_file(&self, path: &Path) -> Result<PathBuf, Error> {
-        match self.get_file_impl(path).await {
-            Ok(file_contents) => {
-                if self.verbose {
-                    eprintln!("Successfully obtained {path:?} from the symbol cache.");
-                }
-                Ok(file_contents)
-            }
-            Err(e) => {
-                if self.verbose {
-                    eprintln!("Encountered an error when trying to obtain {path:?} from the symbol cache: {e:?}");
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// This is the implementation of `get_file`.
-    async fn get_file_impl(&self, rel_path_uncompressed: &Path) -> Result<PathBuf, Error> {
+        let rel_path_uncompressed = path;
         let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
 
         // This array will contain cache paths from `cache*` entries. These get added
@@ -386,22 +473,15 @@ impl SymbolCache {
         Err(Error::NotFound)
     }
 
-    /// Return whether a file is found at `path`, and perform some logging if `self.verbose` is `true`.
+    /// Return whether a file is found at `path`, and notify the observer if not.
     async fn check_file_exists(&self, path: &Path) -> bool {
-        match tokio::fs::metadata(path).await {
-            Ok(meta) if meta.is_file() => {
-                if self.verbose {
-                    eprintln!("Checking if {} exists... yes", path.to_string_lossy());
-                }
-                true
-            }
-            _ => {
-                if self.verbose {
-                    eprintln!("Checking if {} exists... no", path.to_string_lossy());
-                }
-                false
+        let file_exists = matches!(tokio::fs::metadata(path).await, Ok(meta) if meta.is_file());
+        if !file_exists {
+            if let Some(observer) = self.observer.as_deref() {
+                observer.on_file_missed(path);
             }
         }
+        file_exists
     }
 
     /// Attempt to find the file on the local file system. This is done first, before any downloading
@@ -428,6 +508,10 @@ impl SymbolCache {
         };
 
         // We found a file. Yay!
+
+        if let Some(observer) = self.observer.as_deref() {
+            observer.on_file_accessed(&abs_path);
+        }
 
         let uncompressed_path = if is_compressed {
             if let Some((bottom_most_cache, mid_level_caches)) = parent_cache_paths.split_first() {
@@ -480,25 +564,28 @@ impl SymbolCache {
         let (download_dest_cache, remaining_caches) = parent_caches
             .split_last()
             .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
+        let download_dest_cache_path = download_dest_cache
+            .try_to_path(self.default_downstream_store.as_deref())
+            .ok_or(Error::NoDefaultDownstreamStore)?;
         let (dest_path, is_compressed) = match self
             .download_file_to_cache(
                 &full_candidate_url_compr,
                 rel_path_compressed,
-                download_dest_cache,
+                download_dest_cache_path,
             )
             .await
         {
-            Ok(dest_path) => (dest_path, true),
-            Err(_) => match self
+            Some(dest_path) => (dest_path, true),
+            None => match self
                 .download_file_to_cache(
                     &full_candidate_url,
                     rel_path_uncompressed,
-                    download_dest_cache,
+                    download_dest_cache_path,
                 )
                 .await
             {
-                Ok(dest_path) => (dest_path, false),
-                Err(_) => return Ok(None),
+                Some(dest_path) => (dest_path, false),
+                None => return Ok(None),
             },
         };
 
@@ -543,7 +630,11 @@ impl SymbolCache {
                 {
                     // TODO: Check what happens if this process dies in the middle of copying
                     // - do we leave a half-copied file behind? Should we use `create_file_cleanly`?
-                    let _ = tokio::fs::copy(&abs_path, &dest_path).await;
+                    if let Ok(copied_bytes) = tokio::fs::copy(&abs_path, &dest_path).await {
+                        if let Some(observer) = self.observer.as_deref() {
+                            observer.on_file_created(&dest_path, copied_bytes);
+                        }
+                    }
                 }
             }
         }
@@ -556,7 +647,7 @@ impl SymbolCache {
         &self,
         rel_path: &Path,
         cache_path: &Path,
-    ) -> Result<PathBuf, Error> {
+    ) -> Result<PathBuf, std::io::Error> {
         let dest_path = cache_path.join(rel_path);
         if let Some(dir) = dest_path.parent() {
             tokio::fs::create_dir_all(dir).await?;
@@ -579,31 +670,34 @@ impl SymbolCache {
             .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
             .await?;
         let compressed_input_path = compressed_input_path.to_owned();
-        let verbose = self.verbose;
 
-        let dest_path_copy = dest_path.clone();
+        let extracted_size = create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
+            {
+                let mut dest_file = dest_file.into_std().await;
+                tokio::task::spawn_blocking(move || -> std::result::Result<u64, Error> {
+                    let file = std::fs::File::open(&compressed_input_path)?;
+                    let buf_read = BufReader::new(file);
 
-        create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async { {
-            let mut dest_file = dest_file.into_std().await;
-            tokio::task::spawn_blocking(move || -> std::result::Result<(), Error> {
-                let file = std::fs::File::open(&compressed_input_path)?;
-                let buf_read = BufReader::new(file);
+                    let mut cabinet = cab::Cabinet::new(buf_read)?;
+                    let file_name_in_cab = {
+                        // Only pick the first file we encounter. That's the PDB.
+                        let folder = cabinet.folder_entries().next().unwrap();
+                        let file = folder.file_entries().next().unwrap();
+                        file.name().to_string()
+                    };
+                    let mut reader = cabinet.read_file(&file_name_in_cab)?;
+                    let bytes_written = std::io::copy(&mut reader, &mut dest_file)?;
+                    Ok(bytes_written)
+                })
+                .await
+                .expect("task panicked")
+            }
+        })
+        .await?;
 
-                let mut cabinet = cab::Cabinet::new(buf_read)?;
-                let file_name_in_cab = {
-                    // Only pick the first file we encounter. That's the PDB.
-                    let folder = cabinet.folder_entries().next().unwrap();
-                    let file = folder.file_entries().next().unwrap();
-                    file.name().to_string()
-                };
-                if verbose {
-                    eprintln!("Extracting {file_name_in_cab:?} from cab file {compressed_input_path:?} to file {dest_path_copy:?}...");
-                }
-                let mut reader = cabinet.read_file(&file_name_in_cab)?;
-                std::io::copy(&mut reader, &mut dest_file)?;
-                Ok(())
-            }).await.expect("task panicked")
-        }}).await?;
+        if let Some(observer) = self.observer.as_deref() {
+            observer.on_file_created(&dest_path, extracted_size);
+        }
         Ok(dest_path)
     }
 
@@ -612,39 +706,98 @@ impl SymbolCache {
         &self,
         url: &str,
         rel_path: &Path,
-        cache: &CachePath,
-    ) -> Result<PathBuf, Error> {
-        let cache_path = cache
-            .try_to_path(self.default_downstream_store.as_deref())
-            .ok_or(Error::NoDefaultDownstreamStore)?;
-        if self.verbose {
-            eprintln!("Checking URL {url}...");
-        }
-        let response = reqwest::get(url).await?.error_for_status()?;
-
-        // We have a response with a success error code.
-        let dest_path = self
-            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
-            .await?;
-        if self.verbose {
-            eprintln!("Downloading file from {url} to {dest_path:?}...");
+        cache_path: &Path,
+    ) -> Option<PathBuf> {
+        let download_id = NEXT_DOWNLOAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(observer) = self.observer.as_deref() {
+            observer.on_new_download_before_connect(download_id, url);
         }
 
-        let mut stream = response.bytes_stream();
+        let reporter = DownloadStatusReporter::new(download_id, self.observer.clone());
 
-        create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
-            let mut writer = tokio::io::BufWriter::new(dest_file);
-            use futures_util::StreamExt;
-            while let Some(item) = stream.next().await {
-                let item = item?;
-                let mut item_slice = item.as_ref();
-                tokio::io::copy(&mut item_slice, &mut writer).await?;
+        let time_before_connect = Instant::now();
+        let response_result = self
+            .client
+            .get(url)
+            .header("Accept-Encoding", "gzip")
+            .send()
+            .await
+            .and_then(|response| response.error_for_status());
+
+        let response = match response_result {
+            Ok(response) => response,
+            Err(e) => {
+                reporter.download_failed(DownloadError::from(e));
+                return None;
             }
-            writer.flush().await?;
-            Ok(())
-        })
-        .await?;
-        Ok(dest_path)
+        };
+
+        // We have a response with a success status code.
+        let time_after_status = Instant::now();
+        if let Some(observer) = self.observer.as_deref() {
+            observer.on_download_started(download_id);
+        }
+
+        let dest_path = match self
+            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
+            .await
+        {
+            Ok(dest_path) => dest_path,
+            Err(_e) => {
+                reporter.download_failed(DownloadError::CouldNotCreateDestinationDirectory);
+                return None;
+            }
+        };
+
+        let observer = self.observer.clone();
+        let mut stream = match response_to_uncompressed_stream_with_progress(
+            response,
+            move |bytes_so_far, total_bytes| {
+                if let Some(observer) = observer.as_deref() {
+                    observer.on_download_progress(download_id, bytes_so_far, total_bytes)
+                }
+            },
+        ) {
+            Ok(stream) => stream,
+            Err(download::Error::UnexpectedContentEncoding(encoding)) => {
+                reporter.download_failed(DownloadError::UnexpectedContentEncoding(encoding));
+                return None;
+            }
+        };
+
+        let download_result: Result<u64, CleanFileCreationError<std::io::Error>> =
+            create_file_cleanly(&dest_path, |mut dest_file: tokio::fs::File| async move {
+                let uncompressed_size_in_bytes =
+                    futures::io::copy(&mut stream, &mut dest_file.compat_mut()).await?;
+                dest_file.flush().await?;
+                Ok(uncompressed_size_in_bytes)
+            })
+            .await;
+
+        let uncompressed_size_in_bytes = match download_result {
+            Ok(size) => size,
+            Err(CleanFileCreationError::CallbackIndicatedError(e)) => {
+                reporter.download_failed(DownloadError::ErrorDuringDownloading(e));
+                return None;
+            }
+            Err(e) => {
+                reporter.download_failed(DownloadError::ErrorWhileWritingDownloadedFile(e.into()));
+                return None;
+            }
+        };
+
+        let time_after_download = Instant::now();
+        reporter.download_completed(
+            uncompressed_size_in_bytes,
+            time_after_status.duration_since(time_before_connect),
+            time_after_download.duration_since(time_before_connect),
+        );
+
+        if let Some(observer) = self.observer.as_deref() {
+            observer.on_file_created(&dest_path, uncompressed_size_in_bytes);
+        }
+
+        Some(dest_path)
     }
 }
 
@@ -653,7 +806,7 @@ impl SymbolCache {
 fn url_join(base_url: &str, components: std::path::Components) -> String {
     format!(
         "{}/{}",
-        base_url,
+        base_url.trim_end_matches('/'),
         components
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
@@ -679,4 +832,58 @@ fn create_compressed_path(uncompressed_path: &Path) -> Result<PathBuf, Error> {
     let mut compressed_path = uncompressed_path.to_owned();
     compressed_path.set_extension(uncompressed_ext);
     Ok(compressed_path)
+}
+
+/// A helper struct with a drop handler. This lets us detect when a download
+/// is cancelled by dropping the future.
+struct DownloadStatusReporter {
+    /// Set to `None` when `download_failed()` or `download_completed()` is called.
+    download_id: Option<u64>,
+    observer: Option<Arc<dyn SymbolCacheObserver>>,
+}
+
+impl DownloadStatusReporter {
+    pub fn new(download_id: u64, observer: Option<Arc<dyn SymbolCacheObserver>>) -> Self {
+        Self {
+            download_id: Some(download_id),
+            observer,
+        }
+    }
+
+    pub fn download_failed(mut self, e: DownloadError) {
+        if let (Some(download_id), Some(observer)) = (self.download_id, self.observer.as_deref()) {
+            observer.on_download_failed(download_id, e);
+        }
+        self.download_id = None;
+        // Drop self. Now the Drop handler won't do anything.
+    }
+
+    pub fn download_completed(
+        mut self,
+        uncompressed_size_in_bytes: u64,
+        time_until_headers: Duration,
+        time_until_completed: Duration,
+    ) {
+        if let (Some(download_id), Some(observer)) = (self.download_id, self.observer.as_deref()) {
+            observer.on_download_completed(
+                download_id,
+                uncompressed_size_in_bytes,
+                time_until_headers,
+                time_until_completed,
+            );
+        }
+        self.download_id = None;
+        // Drop self. Now the Drop handler won't do anything.
+    }
+}
+
+impl Drop for DownloadStatusReporter {
+    fn drop(&mut self) {
+        if let (Some(download_id), Some(observer)) = (self.download_id, self.observer.as_deref()) {
+            // We were dropped before a call to `download_failed` or `download_completed`.
+            // This was most likely because the future we were stored in was dropped.
+            // Tell the observer.
+            observer.on_download_failed(download_id, DownloadError::FutureDropped);
+        }
+    }
 }

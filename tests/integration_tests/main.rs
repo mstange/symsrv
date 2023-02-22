@@ -1,8 +1,14 @@
+use std::collections::HashMap;
+use std::future::{poll_fn, Future};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 
-use symsrv::{CachePath, NtSymbolPathEntry, SymbolCache};
+use http::StatusCode;
+use symsrv::{CachePath, DownloadError, NtSymbolPathEntry, SymbolCache, SymbolCacheObserver};
 use tempfile::tempdir;
+use tokio::pin;
 
 fn fixtures_dir() -> PathBuf {
     let symsrv_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -19,6 +25,19 @@ fn file_matches_fixture(test_path: &Path, fixture_rel_path: impl AsRef<Path>) ->
     let test_file_bytes = std::fs::read(test_path).unwrap();
     let ref_file_bytes = std::fs::read(path_to_fixture(fixture_rel_path)).unwrap();
     test_file_bytes == ref_file_bytes
+}
+
+fn make_symbol_cache(
+    symbol_path: Vec<NtSymbolPathEntry>,
+    default_downstream_store: Option<&Path>,
+) -> (SymbolCache, Arc<TestObserver>) {
+    let observer = Arc::new(TestObserver::default());
+    let cache = SymbolCache::new(
+        symbol_path,
+        default_downstream_store,
+        Some(observer.clone()),
+    );
+    (cache, observer)
 }
 
 struct TestCacheDir {
@@ -71,6 +90,15 @@ impl TestSymbolServer {
         let mut server = Box::new(mockito::Server::new_async().await);
         let mut mocks = Vec::new();
 
+        // GET requests to unknown URLs should receive a 404 response.
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .expect_at_least(0)
+            .create_async()
+            .await;
+        mocks.push(mock);
+
         // Populate the server.
         for rel_path in prepopulated_files {
             let mock = server
@@ -105,20 +133,35 @@ impl TestSymbolServer {
     pub fn url(&self) -> String {
         self.server.url()
     }
+
+    pub async fn expect_no_fetch_from(&mut self, rel_path: &str) {
+        let mock = self
+            .server
+            .mock("GET", format!("/{rel_path}").as_str())
+            .expect(0)
+            .create_async()
+            .await;
+        self.mocks.push(mock);
+    }
+
+    pub async fn assert(&self) {
+        for mock in &self.mocks {
+            mock.assert_async().await;
+        }
+    }
 }
 
 #[tokio::test]
 async fn test_nothing_available() {
     let default_downstream = TestCacheDir::prepare(&[]).unwrap();
     let cache1 = TestCacheDir::prepare(&[]).unwrap();
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, observer) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path()],
             urls: vec![],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -129,6 +172,27 @@ async fn test_nothing_available() {
         matches!(res, Err(symsrv::Error::NotFound)),
         "Should not find a symbol file in an empty cache"
     );
+    let observer = observer.get_inner();
+    assert_eq!(
+        observer.failed_downloads.len(),
+        0,
+        "Should not have any failed downloads"
+    );
+    assert_eq!(
+        observer.missed_files.len(),
+        2,
+        "Should have two missed files"
+    );
+    assert_eq!(
+        observer.missed_files[0],
+        cache1.path_for_file("dummy.pdb/6E3C51F71CC1F0F64C4C44205044422E1/dummy.pdb"),
+        "Should have missed the uncompressed file"
+    );
+    assert_eq!(
+        observer.missed_files[1],
+        cache1.path_for_file("dummy.pdb/6E3C51F71CC1F0F64C4C44205044422E1/dummy.pd_"),
+        "Should have missed the compressed file"
+    );
 }
 
 #[tokio::test]
@@ -136,14 +200,13 @@ async fn test_simple_available() {
     let default_downstream = TestCacheDir::prepare(&[]).unwrap();
     let cache1 =
         TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).unwrap();
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, observer) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path()],
             urls: vec![],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -151,8 +214,39 @@ async fn test_simple_available() {
         ))
         .await;
     assert!(
-        matches!(res, Ok(path) if file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")),
+        res.is_ok(),
         "Should find a symbol file in a pre-populated cache"
+    );
+    let path = res.unwrap();
+    assert!(
+        file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "Should find a symbol file in a pre-populated cache"
+    );
+
+    let observer = observer.get_inner();
+    assert_eq!(
+        observer.failed_downloads.len(),
+        0,
+        "Should not have any failed downloads"
+    );
+    assert_eq!(
+        observer.missed_files.len(),
+        0,
+        "Should not have any missed files"
+    );
+    assert_eq!(
+        observer.created_files.len(),
+        0,
+        "Should not have created any files"
+    );
+    assert_eq!(
+        observer.accessed_files.len(),
+        1,
+        "Should have accessed one file"
+    );
+    assert_eq!(
+        observer.accessed_files[0], path,
+        "Should have accessed the expected file"
     );
 }
 
@@ -163,14 +257,13 @@ async fn test_simple_compressed() {
     // The cache starts out with the compressed .ex_ file.
     let cache1 =
         TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"]).unwrap();
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, observer) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path()],
             urls: vec![],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -196,6 +289,40 @@ async fn test_simple_compressed() {
         default_downstream.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should be stored in the default downstream store."
     );
+
+    let observer = observer.get_inner();
+    assert_eq!(
+        observer.failed_downloads.len(),
+        0,
+        "Should not have any failed downloads"
+    );
+    assert_eq!(
+        observer.missed_files.len(),
+        1,
+        "Should have one missed file: the uncompressed file"
+    );
+    assert_eq!(
+        observer.created_files.len(),
+        1,
+        "Should have created one file"
+    );
+    assert_eq!(
+        observer.created_files[0].0,
+        default_downstream
+            .path()
+            .join("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "Should have created the uncompressed file"
+    );
+    assert_eq!(
+        observer.accessed_files.len(),
+        1,
+        "Should have accessed one file: the compressed file"
+    );
+    assert_eq!(
+        observer.accessed_files[0],
+        cache1.path_for_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"),
+        "Should have accessed the compressed file"
+    );
 }
 
 #[tokio::test]
@@ -206,14 +333,13 @@ async fn test_propagate_compressed() {
     let cache1 = TestCacheDir::prepare(&[]).unwrap();
     let cache2 =
         TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"]).unwrap();
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, _) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path(), cache2.cache_path()],
             urls: vec![],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -242,14 +368,13 @@ async fn test_simple_server() {
     let server1 =
         TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).await;
 
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, _) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path()],
             urls: vec![server1.url()],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -281,14 +406,13 @@ async fn test_aborted_response() {
         5678,
     );
 
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, observer) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path()],
             urls: vec![server1.url()],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -303,6 +427,130 @@ async fn test_aborted_response() {
         !cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The partial file should not be stored in the cache."
     );
+
+    let observer = observer.get_inner();
+    assert_eq!(
+        observer.failed_downloads.len(),
+        2,
+        "Should have two failed downloads"
+    );
+    assert_eq!(
+        observer.failed_downloads[0].0,
+        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_",
+        "Should have failed to download the compressed file"
+    );
+    assert!(
+        matches!(
+            observer.failed_downloads[0].1,
+            DownloadError::StatusError(StatusCode::NOT_FOUND)
+        ),
+        "Should have failed with the appropriate error"
+    );
+    assert_eq!(
+        observer.failed_downloads[1].0,
+        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        "Should have failed to download the uncompressed file"
+    );
+    assert!(
+        matches!(
+            observer.failed_downloads[1].1,
+            DownloadError::ErrorDuringDownloading(_)
+        ),
+        "Should have failed with the appropriate error"
+    );
+}
+
+// A test where the response from the server is partial and then the connection is aborted.
+#[tokio::test]
+async fn test_dropped_future() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
+    // The cache starts out empty.
+    let cache1 = TestCacheDir::prepare(&[]).unwrap();
+
+    // The server has a single, uncompressed, file.
+    let server1 =
+        TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).await;
+
+    let (symbol_cache, observer) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+    );
+
+    {
+        let get_file_future = symbol_cache.get_file(Path::new(
+            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        ));
+        pin!(get_file_future);
+
+        let observer_copy = observer.clone();
+        poll_fn(move |cx: &mut Context<'_>| {
+            if observer_copy.get_inner().pending_downloads.is_empty() {
+                // Keep polling the future until a download has started.
+                let result = get_file_future.as_mut().poll(cx);
+                result.map(|_| ())
+            } else {
+                // Once the download has started, complete this future so that
+                // the `await` below completes before the download is done.
+                Poll::Ready(())
+            }
+        })
+        .await;
+    }
+
+    // Now res_future has been dropped, and the download should not have completed.
+    // The observer should have been notified about the fact that the download didn't complete.
+    // This test is fairly racy; there may have been two requests, one for the compressed file
+    // and one for the uncompressed file, and we don't know which one will be current when the
+    // future is dropped.
+    let observer = observer.get_inner();
+    assert_ne!(
+        observer.failed_downloads.len(),
+        0,
+        "Should at least one failed download"
+    );
+    assert!(
+        matches!(
+            observer.failed_downloads.last().unwrap().1,
+            DownloadError::FutureDropped
+        ),
+        "Should have failed with a FutureDropped error"
+    );
+}
+
+#[tokio::test]
+async fn test_dont_use_server_if_cache_has_it() {
+    // The file is already in the default downstream store.
+    let default_downstream =
+        TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).unwrap();
+
+    let mut server1 = TestSymbolServer::prepare(&[]).await;
+    server1
+        .expect_no_fetch_from("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")
+        .await;
+
+    let (symbol_cache, _) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![CachePath::DefaultDownstreamStore],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+    );
+    let res = symbol_cache
+        .get_file(Path::new(
+            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        ))
+        .await;
+    assert!(
+        res.is_ok(),
+        "Should find an uncompressed symbol file by downloading the uncompressed file"
+    );
+    server1.assert().await;
 }
 
 #[tokio::test]
@@ -316,14 +564,13 @@ async fn test_server_with_cab_compression() {
     let server1 =
         TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_"]).await;
 
-    let symbol_cache = SymbolCache::new(
+    let (symbol_cache, _) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
             dll: "symsrv.dll".into(),
             cache_paths: vec![cache1.cache_path()],
             urls: vec![server1.url()],
         }],
         Some(default_downstream.path()),
-        false,
     );
     let res = symbol_cache
         .get_file(Path::new(
@@ -356,3 +603,106 @@ async fn test_server_with_cab_compression() {
 //  - Tests with multiple servers, falling back on 404 and other error responses
 //  - Tests for `NtSymbolPathEntry::Cache`: make sure things are propagated into that cache for
 //    files found in caches following that entry but not preceding it.
+
+#[derive(Debug, Default)]
+struct TestObserverInner {
+    pending_downloads: HashMap<u64, String>,
+    completed_downloads: Vec<String>,
+    failed_downloads: Vec<(String, DownloadError)>,
+    missed_files: Vec<PathBuf>,
+    created_files: Vec<(PathBuf, u64)>,
+    accessed_files: Vec<PathBuf>,
+}
+
+impl TestObserverInner {
+    fn on_new_download_before_connect(&mut self, download_id: u64, url: &str) {
+        self.pending_downloads.insert(download_id, url.to_owned());
+    }
+
+    fn on_download_failed(&mut self, download_id: u64, error: DownloadError) {
+        let url = self.pending_downloads.remove(&download_id).unwrap();
+        self.failed_downloads.push((url, error));
+    }
+
+    fn on_download_completed(
+        &mut self,
+        download_id: u64,
+        _uncompressed_size_in_bytes: u64,
+        _time_until_headers: std::time::Duration,
+        _time_until_completed: std::time::Duration,
+    ) {
+        let url = self.pending_downloads.remove(&download_id).unwrap();
+        self.completed_downloads.push(url);
+    }
+
+    fn on_file_missed(&mut self, path: &Path) {
+        self.missed_files.push(path.to_owned());
+    }
+
+    fn on_file_created(&mut self, path: &Path, size_in_bytes: u64) {
+        self.created_files.push((path.to_owned(), size_in_bytes));
+    }
+
+    fn on_file_accessed(&mut self, path: &Path) {
+        self.accessed_files.push(path.to_owned());
+    }
+}
+
+#[derive(Debug, Default)]
+struct TestObserver {
+    inner: Mutex<TestObserverInner>,
+}
+
+impl TestObserver {
+    fn get_inner(&self) -> MutexGuard<'_, TestObserverInner> {
+        self.inner.lock().unwrap()
+    }
+}
+
+impl SymbolCacheObserver for TestObserver {
+    fn on_new_download_before_connect(&self, download_id: u64, url: &str) {
+        self.get_inner()
+            .on_new_download_before_connect(download_id, url);
+    }
+
+    fn on_download_failed(&self, download_id: u64, error: DownloadError) {
+        self.get_inner().on_download_failed(download_id, error);
+    }
+
+    fn on_download_started(&self, _download_id: u64) {}
+
+    fn on_download_progress(
+        &self,
+        _download_id: u64,
+        _bytes_so_far: u64,
+        _total_bytes: Option<u64>,
+    ) {
+    }
+
+    fn on_download_completed(
+        &self,
+        download_id: u64,
+        uncompressed_size_in_bytes: u64,
+        time_until_headers: std::time::Duration,
+        time_until_completed: std::time::Duration,
+    ) {
+        self.get_inner().on_download_completed(
+            download_id,
+            uncompressed_size_in_bytes,
+            time_until_headers,
+            time_until_completed,
+        );
+    }
+
+    fn on_file_missed(&self, path: &Path) {
+        self.get_inner().on_file_missed(path);
+    }
+
+    fn on_file_created(&self, path: &Path, size_in_bytes: u64) {
+        self.get_inner().on_file_created(path, size_in_bytes);
+    }
+
+    fn on_file_accessed(&self, path: &Path) {
+        self.get_inner().on_file_accessed(path);
+    }
+}

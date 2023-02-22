@@ -11,21 +11,32 @@ exclude = ["/.github", "/tests"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-reqwest = { version = "0.11.10", default-features = false, features = [
+reqwest = { version = "0.11.14", default-features = false, features = [
     "rustls-tls",
-    "gzip",
-    "brotli",
-    "deflate",
     "stream"
 ] }
 dirs = "5"
-tokio = { version = "1.17.0", features = ["fs"] }
+tokio = { version = "1.25.0", default-features = false, features = ["fs"] }
 thiserror = "1.0.26"
 cab = "0.5"
 futures-util = "0.3.26"
 fs4 = { version = "0.7.0", features = ["tokio"] }
+futures = "0.3.26"
+async-compat = "0.2.1"
+async-compression = { version = "0.4.6", default-features = false, features = [
+    "tokio",
+    "futures-io",
+    "gzip"
+] }
+http = "0.2.11"
 
 [dev-dependencies]
 tempfile = "3.1.0"
-tokio = { version = "1.17.0", features = ["macros"] }
 mockito = "1.2"
+tokio = { version = "1.25.0", default-features = false, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread"
+] }
+indicatif = "0.17.3"
+clap = { version = "4.5.1", features = ["derive"] }
