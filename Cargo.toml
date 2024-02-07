@@ -21,7 +21,7 @@ reqwest = { version = "0.11.10", default-features = false, features = [
 dirs = "5"
 tokio = { version = "1.17.0", features = ["fs"] }
 thiserror = "1.0.26"
-cab = "0.4.0"
+cab = "0.5"
 futures-util = "0.3.26"
 
 [dev-dependencies]
