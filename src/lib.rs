@@ -565,7 +565,8 @@ impl SymbolCache {
             .await?;
         let compressed_input_path = compressed_input_path.to_owned();
         let verbose = self.verbose;
-        let x = tokio::spawn(async move {
+        
+        tokio::spawn(async move {
             let file = std::fs::File::open(&compressed_input_path)?;
             let buf_read = BufReader::new(file);
 
@@ -583,8 +584,7 @@ impl SymbolCache {
             let mut dest_file = std::fs::File::create(&dest_path)?;
             std::io::copy(&mut reader, &mut dest_file)?;
             Ok(dest_path)
-        }).await?;
-        x
+        }).await?
     }
 
     /// Download the file at `url` into memory.

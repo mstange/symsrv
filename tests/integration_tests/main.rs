@@ -160,7 +160,7 @@ async fn test_simple_compressed() {
         ))
         .await;
     assert!(
-        matches!(res, Ok(_)),
+        res.is_ok(),
         "Should find an uncompressed symbol file in a cache with the compressed file"
     );
     assert!(
@@ -239,7 +239,7 @@ async fn test_simple_server() {
         ))
         .await;
     assert!(
-        matches!(res, Ok(_)),
+        res.is_ok(),
         "Should find an uncompressed symbol file by downloading the uncompressed file"
     );
     assert!(
@@ -274,7 +274,7 @@ async fn test_server_with_cab_compression() {
         ))
         .await;
     assert!(
-        matches!(res, Ok(_)),
+        res.is_ok(),
         "Should find an uncompressed symbol file by downloading the uncompressed file"
     );
     assert!(
