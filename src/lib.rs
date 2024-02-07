@@ -565,7 +565,7 @@ impl SymbolCache {
             .await?;
         let compressed_input_path = compressed_input_path.to_owned();
         let verbose = self.verbose;
-        
+
         tokio::spawn(async move {
             let file = std::fs::File::open(&compressed_input_path)?;
             let buf_read = BufReader::new(file);
