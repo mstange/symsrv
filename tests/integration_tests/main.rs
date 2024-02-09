@@ -84,6 +84,24 @@ impl TestSymbolServer {
         Self { server, mocks }
     }
 
+    pub fn add_mock_which_sends_a_chunk_and_then_cancels(
+        &mut self,
+        rel_path: &str,
+        cutoff_size: usize,
+    ) {
+        let body = std::fs::read(path_to_fixture(rel_path)).unwrap();
+        let mock = self
+            .server
+            .mock("GET", format!("/{rel_path}").as_str())
+            .with_chunked_body(move |w| {
+                let partial_body = &body[..cutoff_size];
+                w.write_all(partial_body).unwrap();
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "canceled"))
+            })
+            .create();
+        self.mocks.push(mock);
+    }
+
     pub fn url(&self) -> String {
         self.server.url()
     }
@@ -245,6 +263,45 @@ async fn test_simple_server() {
     assert!(
         cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should be stored in the cache."
+    );
+}
+
+// A test where the response from the server is partial and then the connection is aborted.
+#[tokio::test]
+async fn test_aborted_response() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
+    // The cache starts out empty.
+    let cache1 = TestCacheDir::prepare(&[]).unwrap();
+
+    // The server has a single, uncompressed, file.
+    let mut server1 = TestSymbolServer::prepare(&[]).await;
+    server1.add_mock_which_sends_a_chunk_and_then_cancels(
+        "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        5678,
+    );
+
+    let symbol_cache = SymbolCache::new(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+        false,
+    );
+    let res = symbol_cache
+        .get_file(Path::new(
+            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        ))
+        .await;
+    assert!(
+        res.is_err(),
+        "The response is aborted, so the result should be an error."
+    );
+    assert!(
+        !cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The partial file should not be stored in the cache."
     );
 }
 

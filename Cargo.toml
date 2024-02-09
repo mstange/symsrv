@@ -23,6 +23,7 @@ tokio = { version = "1.17.0", features = ["fs"] }
 thiserror = "1.0.26"
 cab = "0.5"
 futures-util = "0.3.26"
+fs4 = { version = "0.7.0", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3.1.0"

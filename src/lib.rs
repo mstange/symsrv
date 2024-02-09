@@ -39,10 +39,13 @@
 //! # }
 //! ```
 
+mod file_creation;
+
 use std::io::BufReader;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+use file_creation::{create_file_cleanly, CleanFileCreationError};
 use tokio::io::AsyncWriteExt;
 
 /// The parsed representation of one entry in the (semicolon-separated list of entries in the) `_NT_SYMBOL_PATH` environment variable.
@@ -204,6 +207,15 @@ pub enum Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Error {
         Error::IoError(err)
+    }
+}
+
+impl From<CleanFileCreationError<Error>> for Error {
+    fn from(e: CleanFileCreationError<Error>) -> Error {
+        match e {
+            CleanFileCreationError::CallbackIndicatedError(e) => e,
+            e => Error::IoError(e.into()),
+        }
     }
 }
 
@@ -529,6 +541,8 @@ impl SymbolCache {
                     .make_dest_path_and_ensure_parent_dirs(rel_path, cache_dir)
                     .await
                 {
+                    // TODO: Check what happens if this process dies in the middle of copying
+                    // - do we leave a half-copied file behind? Should we use `create_file_cleanly`?
                     let _ = tokio::fs::copy(&abs_path, &dest_path).await;
                 }
             }
@@ -567,25 +581,30 @@ impl SymbolCache {
         let compressed_input_path = compressed_input_path.to_owned();
         let verbose = self.verbose;
 
-        tokio::spawn(async move {
-            let file = std::fs::File::open(&compressed_input_path)?;
-            let buf_read = BufReader::new(file);
+        let dest_path_copy = dest_path.clone();
 
-            let mut cabinet = cab::Cabinet::new(buf_read)?;
-            let file_name_in_cab = {
-                // Only pick the first file we encounter. That's the PDB.
-                let folder = cabinet.folder_entries().next().unwrap();
-                let file = folder.file_entries().next().unwrap();
-                file.name().to_string()
-            };
-            if verbose {
-                eprintln!("Extracting {file_name_in_cab:?} from cab file {compressed_input_path:?} to file {dest_path:?}...");
-            }
-            let mut reader = cabinet.read_file(&file_name_in_cab)?;
-            let mut dest_file = std::fs::File::create(&dest_path)?;
-            std::io::copy(&mut reader, &mut dest_file)?;
-            Ok(dest_path)
-        }).await?
+        create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async { {
+            let mut dest_file = dest_file.into_std().await;
+            tokio::task::spawn_blocking(move || -> std::result::Result<(), Error> {
+                let file = std::fs::File::open(&compressed_input_path)?;
+                let buf_read = BufReader::new(file);
+
+                let mut cabinet = cab::Cabinet::new(buf_read)?;
+                let file_name_in_cab = {
+                    // Only pick the first file we encounter. That's the PDB.
+                    let folder = cabinet.folder_entries().next().unwrap();
+                    let file = folder.file_entries().next().unwrap();
+                    file.name().to_string()
+                };
+                if verbose {
+                    eprintln!("Extracting {file_name_in_cab:?} from cab file {compressed_input_path:?} to file {dest_path_copy:?}...");
+                }
+                let mut reader = cabinet.read_file(&file_name_in_cab)?;
+                std::io::copy(&mut reader, &mut dest_file)?;
+                Ok(())
+            }).await.expect("task panicked")
+        }}).await?;
+        Ok(dest_path)
     }
 
     /// Download the file at `url` into memory.
@@ -613,15 +632,18 @@ impl SymbolCache {
 
         let mut stream = response.bytes_stream();
 
-        let file = tokio::fs::File::create(&dest_path).await?;
-        let mut writer = tokio::io::BufWriter::new(file);
-        use futures_util::StreamExt;
-        while let Some(item) = stream.next().await {
-            let item = item?;
-            let mut item_slice = item.as_ref();
-            tokio::io::copy(&mut item_slice, &mut writer).await?;
-        }
-        writer.flush().await?;
+        create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
+            let mut writer = tokio::io::BufWriter::new(dest_file);
+            use futures_util::StreamExt;
+            while let Some(item) = stream.next().await {
+                let item = item?;
+                let mut item_slice = item.as_ref();
+                tokio::io::copy(&mut item_slice, &mut writer).await?;
+            }
+            writer.flush().await?;
+            Ok(())
+        })
+        .await?;
         Ok(dest_path)
     }
 }
