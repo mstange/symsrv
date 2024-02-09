@@ -269,7 +269,8 @@ impl SymbolCache {
     async fn get_file_impl(&self, rel_path_uncompressed: &Path) -> Result<PathBuf, Error> {
         let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
 
-        // The cache paths frome `cache*` entries, which apply to all subsequent
+        // This array will contain cache paths from `cache*` entries. These get added
+        // once they are encountered. Once encountered, they apply to all subsequent
         // entries.
         let mut persisted_cache_paths: Vec<CachePath> = Vec::new();
 
