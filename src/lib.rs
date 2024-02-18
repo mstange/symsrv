@@ -51,6 +51,7 @@ use std::time::Duration;
 
 use async_compat::CompatExt;
 use file_creation::{create_file_cleanly, CleanFileCreationError};
+use futures_util::TryFutureExt;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
@@ -562,25 +563,33 @@ impl SymsrvDownloader {
         let download_dest_cache_path = self
             .resolve_cache_path(download_dest_cache)
             .ok_or(Error::NoDefaultDownstreamStore)?;
-        let (dest_path, is_compressed) = match self
-            .download_file_to_cache(
-                &full_candidate_url,
-                rel_path_uncompressed,
-                download_dest_cache_path,
-            )
-            .await
-        {
-            Some(dest_path) => (dest_path, false),
-            None => match self
-                .download_file_to_cache(
-                    &full_candidate_url_compr,
-                    rel_path_compressed,
+        let response_future = self.prepare_download_of_file(&full_candidate_url);
+        let response_future_compr = self.prepare_download_of_file(&full_candidate_url_compr);
+        let (dest_path, is_compressed) = match response_future
+            .and_then(|(notifier, response)| {
+                self.download_file_to_cache(
+                    notifier,
+                    response,
+                    rel_path_uncompressed,
                     download_dest_cache_path,
                 )
+            })
+            .await
+        {
+            Ok(dest_path) => (dest_path, false),
+            Err(()) => match response_future_compr
+                .and_then(|(notifier, response)| {
+                    self.download_file_to_cache(
+                        notifier,
+                        response,
+                        rel_path_compressed,
+                        download_dest_cache_path,
+                    )
+                })
                 .await
             {
-                Some(dest_path) => (dest_path, true),
-                None => return Ok(None),
+                Ok(dest_path) => (dest_path, true),
+                Err(()) => return Ok(None),
             },
         };
 
@@ -697,7 +706,7 @@ impl SymsrvDownloader {
     async fn prepare_download_of_file(
         &self,
         url: &str,
-    ) -> Option<(DownloadStatusReporter, reqwest::Response)> {
+    ) -> Result<(DownloadStatusReporter, reqwest::Response), ()> {
         let download_id = NEXT_DOWNLOAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(observer) = self.observer.as_deref() {
             observer.on_new_download_before_connect(download_id, url);
@@ -717,22 +726,21 @@ impl SymsrvDownloader {
             Ok(response) => response,
             Err(e) => {
                 reporter.download_failed(DownloadError::from(e));
-                return None;
+                return Err(());
             }
         };
 
-        Some((reporter, response))
+        Ok((reporter, response))
     }
 
     /// Download the file at `url` into memory.
     async fn download_file_to_cache(
         &self,
-        url: &str,
+        reporter: DownloadStatusReporter,
+        response: reqwest::Response,
         rel_path: &Path,
         cache_path: &Path,
-    ) -> Option<PathBuf> {
-        let (reporter, response) = self.prepare_download_of_file(url).await?;
-
+    ) -> Result<PathBuf, ()> {
         // We have a response with a success status code.
         let ts_after_status = Instant::now();
         let download_id = reporter.download_id();
@@ -747,7 +755,7 @@ impl SymsrvDownloader {
             Ok(dest_path) => dest_path,
             Err(_e) => {
                 reporter.download_failed(DownloadError::CouldNotCreateDestinationDirectory);
-                return None;
+                return Err(());
             }
         };
 
@@ -763,7 +771,7 @@ impl SymsrvDownloader {
             Ok(stream) => stream,
             Err(download::Error::UnexpectedContentEncoding(encoding)) => {
                 reporter.download_failed(DownloadError::UnexpectedContentEncoding(encoding));
-                return None;
+                return Err(());
             }
         };
 
@@ -780,11 +788,11 @@ impl SymsrvDownloader {
             Ok(size) => size,
             Err(CleanFileCreationError::CallbackIndicatedError(e)) => {
                 reporter.download_failed(DownloadError::ErrorDuringDownloading(e));
-                return None;
+                return Err(());
             }
             Err(e) => {
                 reporter.download_failed(DownloadError::ErrorWhileWritingDownloadedFile(e.into()));
-                return None;
+                return Err(());
             }
         };
 
@@ -799,7 +807,7 @@ impl SymsrvDownloader {
             observer.on_file_created(&dest_path, uncompressed_size_in_bytes);
         }
 
-        Some(dest_path)
+        Ok(dest_path)
     }
 }
 
