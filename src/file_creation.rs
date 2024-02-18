@@ -44,10 +44,11 @@ impl<E: std::error::Error + Send + Sync + 'static> From<CleanFileCreationError<E
 /// `write_fn` must drop the file before it returns.
 ///
 /// This function tries to minimize the chance of leaving a partially-written file at the dest_path;
-/// the final file is only created (by renaming a temporary file) once the write function
-/// has returned successfully.
+/// the final file is only created once the write function has returned successfully.
+/// This is achieved by writing to a temporary file and then renaming it to the final file.
 ///
-/// We lock the file during writing in order to minimize interference by other processes.
+/// We lock the temporary file during writing in order to minimize interference by other processes,
+/// for example if this very code is running in two processes at the same time.
 ///
 /// The steps are:
 ///
@@ -58,18 +59,21 @@ impl<E: std::error::Error + Send + Sync + 'static> From<CleanFileCreationError<E
 /// 5. Close (and automatically unlock) the temporary file.
 /// 6. Rename the temporary file to the final file.
 ///
-/// There's at least one problem here: Steps 5 and 6 are not atomic. Another process
-/// could interfere with the temporary file in the time between closing (and unlocking)
-/// the temporary file and renaming it. Then the rename step would rename the corrupted
-/// file. For example, we'd get into this situation if, in the time between step 5 and 6,
-/// another process runs steps 1-3 or more.
+/// There is one problem here: Steps 5 and 6 are not atomic. Another process could inadvertently
+/// mess with the temporary file in the time between closing (and unlocking) the temporary file
+/// and renaming it - even if that other process tries to minimize its own damage by respecting
+/// the file lock. If this happens, the rename step would rename the corrupted file.
+/// For example, we'd get into this situation if, in the time between step 5 and 6,
+/// another process runs steps 1 to 3.
+/// No solution is attempted for this problem.
 ///
-/// In the various failure cases, we try to clean up the temporary file. If this process is
-/// terminated before we can do so, the temporary file will be left behind.
+/// In regular failure cases (full disk, other IO errors, etc), we try to clean up the temporary
+/// file. If this process is terminated before we can do so, the temporary file will be left
+/// behind, but at least it will no longer be locked.
 ///
 /// If the temporary file already exists and is locked, we return an error.
-/// This happens if we are the second process in the scenario above, e.g. if the first process
-/// is somewhere between steps 2 and 5.
+/// This happens if we are the second process in the scenario above, e.g. if we're called at a
+/// time when the another process is somewhere between steps 2 and 5 on the same file.
 pub async fn create_file_cleanly<E, F, G, V>(
     dest_path: &Path,
     write_fn: F,
