@@ -51,7 +51,6 @@ use std::time::Duration;
 
 use async_compat::CompatExt;
 use file_creation::{create_file_cleanly, CleanFileCreationError};
-use futures_util::TryFutureExt;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
@@ -422,6 +421,10 @@ impl SymsrvDownloader {
                         }
                     }
 
+                    // The symbol file was not found in any of the cache paths. Try to download it
+                    // from the server URLs in this entry.
+
+                    // First, make sure we have a place to download to.
                     let (download_dest_cache, remaining_caches) = parent_cache_paths
                         .split_last()
                         .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
@@ -432,21 +435,85 @@ impl SymsrvDownloader {
                         .first()
                         .unwrap_or(&CachePath::DefaultDownstreamStore);
 
-                    // Download the symbol file from the URL(s) in this entry. If found, also persist
-                    // the file to the previous cache paths.
+                    // Make a list of URLs to try. For each URL, we try both the uncompressed and
+                    // compressed file, in that order.
+                    let mut file_urls = Vec::with_capacity(urls.len() * 2);
                     for server_url in urls {
-                        if let Some(found_path) = self
-                            .download_from_server_and_propagate_into_caches(
-                                server_url,
-                                download_dest_cache_dir,
-                                remaining_caches,
-                                bottom_cache,
-                                rel_path_uncompressed,
-                                &rel_path_compressed,
-                            )
-                            .await?
+                        file_urls.push((
+                            url_join(server_url, rel_path_uncompressed.components()),
+                            rel_path_uncompressed,
+                            false,
+                        ));
+                        file_urls.push((
+                            url_join(server_url, rel_path_compressed.components()),
+                            &rel_path_compressed,
+                            true,
+                        ));
+                    }
+
+                    // Prepare requests to all candidate URLs. We are not actually starting these requests
+                    // yet because we're not calling poll on the futures until we hit the await call in the loop below.
+                    let response_futures: Vec<_> =
+                        file_urls
+                            .into_iter()
+                            .map(|(file_url, rel_path, is_compressed)| async move {
+                                let (notifier, response) =
+                                    self.prepare_download_of_file(&file_url).await?;
+                                Ok::<(DownloadStatusReporter, reqwest::Response, &Path, bool), ()>(
+                                    (notifier, response, rel_path, is_compressed),
+                                )
+                            })
+                            .collect();
+
+                    // Download the symbol file from the candidate URLs we've computed. If successful, also persist
+                    // the file to the previous cache paths.
+                    for response_future in response_futures {
+                        if let Ok((notifier, response, rel_path, is_compressed)) =
+                            response_future.await
                         {
-                            return Ok(found_path);
+                            if let Ok(dest_path) = self
+                                .download_file_to_cache(
+                                    notifier,
+                                    response,
+                                    rel_path,
+                                    download_dest_cache_dir,
+                                )
+                                .await
+                            {
+                                // We have a file!
+                                let uncompressed_dest_path = if is_compressed {
+                                    if let Some((
+                                        _remaining_bottom_cache,
+                                        remaining_mid_level_caches,
+                                    )) = remaining_caches.split_first()
+                                    {
+                                        // Save the compressed file to the mid-level caches.
+                                        self.copy_file_to_caches(
+                                            &rel_path_compressed,
+                                            &dest_path,
+                                            remaining_mid_level_caches,
+                                        )
+                                        .await;
+                                    }
+                                    // Extract the file into the bottom cache.
+                                    self.extract_to_file_in_cache(
+                                        &dest_path,
+                                        rel_path_uncompressed,
+                                        bottom_cache,
+                                    )
+                                    .await?
+                                } else {
+                                    // The file is not compressed. Just copy to the other caches.
+                                    self.copy_file_to_caches(
+                                        rel_path_uncompressed,
+                                        &dest_path,
+                                        remaining_caches,
+                                    )
+                                    .await;
+                                    dest_path
+                                };
+                                return Ok(uncompressed_dest_path);
+                            }
                         }
                     }
                 }
@@ -544,87 +611,6 @@ impl SymsrvDownloader {
         };
 
         Ok(Some(uncompressed_path))
-    }
-
-    /// Attempt to download a file from the given server. This tries both the compressed and
-    /// the non-compressed file. If successful, the file is stored in all the cache directories.
-    /// On success, the bottom cache always has the uncompressed file, and the other cache
-    /// directories have whichever file was downloaded from the server.
-    ///
-    /// The return value is a path to the uncompressed file in the bottom-most cache.
-    ///
-    /// Arguments:
-    ///
-    ///  - `server_url` is the base URL, to which the relative paths will be appended.
-    ///  - `download_dest_cache_dir` is the directory where the downloaded file (compressed or uncompressed) will be stored.
-    ///  - `remaining_caches` is the list of mid-level caches. The downloaded file (compressed or uncompressed) will be copied into these caches. Includes the bottom cache.
-    ///  - `bottom_cache` is the the cache that will store the extracted file. It also stores the compressed file because it's part of remaining_caches.
-    ///  - `rel_path_uncompressed` is the relative path to the uncompressed file.
-    ///  - `rel_path_compressed` is the relative path to the compressed file.
-    async fn download_from_server_and_propagate_into_caches(
-        &self,
-        server_url: &str,
-        download_dest_cache_dir: &Path,
-        remaining_caches: &[CachePath],
-        bottom_cache: &CachePath,
-        rel_path_uncompressed: &Path,
-        rel_path_compressed: &Path,
-    ) -> Result<Option<PathBuf>, Error> {
-        let full_candidate_url = url_join(server_url, rel_path_uncompressed.components());
-        let full_candidate_url_compr = url_join(server_url, rel_path_compressed.components());
-        let response_future = self.prepare_download_of_file(&full_candidate_url);
-        let response_future_compr = self.prepare_download_of_file(&full_candidate_url_compr);
-        let (dest_path, is_compressed) = match response_future
-            .and_then(|(notifier, response)| {
-                self.download_file_to_cache(
-                    notifier,
-                    response,
-                    rel_path_uncompressed,
-                    download_dest_cache_dir,
-                )
-            })
-            .await
-        {
-            Ok(dest_path) => (dest_path, false),
-            Err(()) => match response_future_compr
-                .and_then(|(notifier, response)| {
-                    self.download_file_to_cache(
-                        notifier,
-                        response,
-                        rel_path_compressed,
-                        download_dest_cache_dir,
-                    )
-                })
-                .await
-            {
-                Ok(dest_path) => (dest_path, true),
-                Err(()) => return Ok(None),
-            },
-        };
-
-        // We have a file!
-        let uncompressed_dest_path = if is_compressed {
-            if let Some((_remaining_bottom_cache, remaining_mid_level_caches)) =
-                remaining_caches.split_first()
-            {
-                // Save the compressed file to the mid-level caches.
-                self.copy_file_to_caches(
-                    rel_path_compressed,
-                    &dest_path,
-                    remaining_mid_level_caches,
-                )
-                .await;
-            }
-            // Extract the file into the bottom cache.
-            self.extract_to_file_in_cache(&dest_path, rel_path_uncompressed, bottom_cache)
-                .await?
-        } else {
-            // The file is not compressed. Just copy to the other caches.
-            self.copy_file_to_caches(rel_path_uncompressed, &dest_path, remaining_caches)
-                .await;
-            dest_path
-        };
-        Ok(Some(uncompressed_dest_path))
     }
 
     /// Copy the file at `abs_path` to the cache directories given by `caches`, using
