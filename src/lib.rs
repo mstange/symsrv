@@ -422,13 +422,25 @@ impl SymsrvDownloader {
                         }
                     }
 
+                    let (download_dest_cache, remaining_caches) = parent_cache_paths
+                        .split_last()
+                        .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
+                    let download_dest_cache_dir = self
+                        .resolve_cache_path(download_dest_cache)
+                        .ok_or(Error::NoDefaultDownstreamStore)?;
+                    let bottom_cache = parent_cache_paths
+                        .first()
+                        .unwrap_or(&CachePath::DefaultDownstreamStore);
+
                     // Download the symbol file from the URL(s) in this entry. If found, also persist
                     // the file to the previous cache paths.
-                    for url in urls {
+                    for server_url in urls {
                         if let Some(found_path) = self
-                            .check_url(
-                                url,
-                                &parent_cache_paths,
+                            .download_from_server_and_propagate_into_caches(
+                                server_url,
+                                download_dest_cache_dir,
+                                remaining_caches,
+                                bottom_cache,
                                 rel_path_uncompressed,
                                 &rel_path_compressed,
                             )
@@ -539,30 +551,27 @@ impl SymsrvDownloader {
     /// On success, the bottom cache always has the uncompressed file, and the other cache
     /// directories have whichever file was downloaded from the server.
     ///
-    /// The return value is either an mmap view into the uncompressed file in the bottom-most
-    /// cache, or, if no cache directories were given, a `Vec` of the uncompressed file bytes.
+    /// The return value is a path to the uncompressed file in the bottom-most cache.
     ///
     /// Arguments:
     ///
-    ///  - `url` is the base URL, to which the relative paths will be appended.
-    ///  - `parent_cache_paths` is the list of cache directories, starting with the bottom-most cache.
+    ///  - `server_url` is the base URL, to which the relative paths will be appended.
+    ///  - `download_dest_cache_dir` is the directory where the downloaded file (compressed or uncompressed) will be stored.
+    ///  - `remaining_caches` is the list of mid-level caches. The downloaded file (compressed or uncompressed) will be copied into these caches. Includes the bottom cache.
+    ///  - `bottom_cache` is the the cache that will store the extracted file. It also stores the compressed file because it's part of remaining_caches.
     ///  - `rel_path_uncompressed` is the relative path to the uncompressed file.
     ///  - `rel_path_compressed` is the relative path to the compressed file.
-    async fn check_url(
+    async fn download_from_server_and_propagate_into_caches(
         &self,
-        url: &str,
-        parent_caches: &[CachePath],
+        server_url: &str,
+        download_dest_cache_dir: &Path,
+        remaining_caches: &[CachePath],
+        bottom_cache: &CachePath,
         rel_path_uncompressed: &Path,
         rel_path_compressed: &Path,
     ) -> Result<Option<PathBuf>, Error> {
-        let full_candidate_url = url_join(url, rel_path_uncompressed.components());
-        let full_candidate_url_compr = url_join(url, rel_path_compressed.components());
-        let (download_dest_cache, remaining_caches) = parent_caches
-            .split_last()
-            .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
-        let download_dest_cache_dir = self
-            .resolve_cache_path(download_dest_cache)
-            .ok_or(Error::NoDefaultDownstreamStore)?;
+        let full_candidate_url = url_join(server_url, rel_path_uncompressed.components());
+        let full_candidate_url_compr = url_join(server_url, rel_path_compressed.components());
         let response_future = self.prepare_download_of_file(&full_candidate_url);
         let response_future_compr = self.prepare_download_of_file(&full_candidate_url_compr);
         let (dest_path, is_compressed) = match response_future
@@ -607,9 +616,6 @@ impl SymsrvDownloader {
                 .await;
             }
             // Extract the file into the bottom cache.
-            let bottom_cache = parent_caches
-                .first()
-                .unwrap_or(&CachePath::DefaultDownstreamStore);
             self.extract_to_file_in_cache(&dest_path, rel_path_uncompressed, bottom_cache)
                 .await?
         } else {
