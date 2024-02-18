@@ -17,7 +17,7 @@ The downloaded symbols are stored and never evicted.
 
 ```rust
 use std::path::PathBuf;
-use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymbolCache};
+use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymsrvDownloader};
 
 // Parse the _NT_SYMBOL_PATH environment variable.
 let symbol_path =
@@ -25,7 +25,7 @@ let symbol_path =
 
 // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
 let default_downstream = get_default_downstream_store(); // "~/sym"
-let symbol_cache = SymbolCache::new(symbol_path, default_downstream.as_deref(), false);
+let symbol_cache = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), false);
 
 // Download and cache a PDB file.
 let relative_path: PathBuf =

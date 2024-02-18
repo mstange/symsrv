@@ -2,7 +2,7 @@ use clap::Parser;
 use indicatif::{DecimalBytes, MultiProgress, ProgressBar};
 use symsrv::{
     get_default_downstream_store, parse_nt_symbol_path, CachePath, DownloadError,
-    NtSymbolPathEntry, SymbolCache, SymbolCacheObserver,
+    NtSymbolPathEntry, SymsrvDownloader, SymsrvObserver,
 };
 
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    let symbol_cache = SymbolCache::new(
+    let symbol_cache = SymsrvDownloader::new(
         parsed_nt_symbol_path,
         args.default_downstream_store
             .or(get_default_downstream_store())
@@ -124,7 +124,7 @@ impl SymFetchObserver {
     }
 }
 
-impl SymbolCacheObserver for SymFetchObserver {
+impl SymsrvObserver for SymFetchObserver {
     fn on_new_download_before_connect(&self, download_id: u64, url: &str) {
         self.get_inner()
             .on_new_download_before_connect(download_id, url);

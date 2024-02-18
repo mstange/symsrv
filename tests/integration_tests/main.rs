@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use http::StatusCode;
-use symsrv::{CachePath, DownloadError, NtSymbolPathEntry, SymbolCache, SymbolCacheObserver};
+use symsrv::{CachePath, DownloadError, NtSymbolPathEntry, SymsrvDownloader, SymsrvObserver};
 use tempfile::tempdir;
 use tokio::pin;
 
@@ -30,9 +30,9 @@ fn file_matches_fixture(test_path: &Path, fixture_rel_path: impl AsRef<Path>) ->
 fn make_symbol_cache(
     symbol_path: Vec<NtSymbolPathEntry>,
     default_downstream_store: Option<&Path>,
-) -> (SymbolCache, Arc<TestObserver>) {
+) -> (SymsrvDownloader, Arc<TestObserver>) {
     let observer = Arc::new(TestObserver::default());
-    let cache = SymbolCache::new(
+    let cache = SymsrvDownloader::new(
         symbol_path,
         default_downstream_store,
         Some(observer.clone()),
@@ -659,7 +659,7 @@ impl TestObserver {
     }
 }
 
-impl SymbolCacheObserver for TestObserver {
+impl SymsrvObserver for TestObserver {
     fn on_new_download_before_connect(&self, download_id: u64, url: &str) {
         self.get_inner()
             .on_new_download_before_connect(download_id, url);

@@ -15,7 +15,7 @@
 //!
 //! ```
 //! use std::path::PathBuf;
-//! use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymbolCache};
+//! use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymsrvDownloader};
 //!
 //! # fn open_pdb_at_path(p: &std::path::Path) {}
 //! #
@@ -26,7 +26,7 @@
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
 //! let default_downstream = get_default_downstream_store(); // "~/sym"
-//! let symbol_cache = SymbolCache::new(symbol_path, default_downstream.as_deref(), None);
+//! let symbol_cache = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
 //!
 //! // Download and cache a PDB file.
 //! let relative_path: PathBuf =
@@ -188,7 +188,7 @@ pub enum Error {
     IoError(#[source] std::io::Error),
 
     /// The requested file was not found.
-    #[error("The file was not found in the SymbolCache.")]
+    #[error("The file was not found in the SymsrvDownloader.")]
     NotFound,
 
     /// No default downstream store was specified, but it was needed.
@@ -287,7 +287,7 @@ impl From<reqwest::Error> for DownloadError {
     }
 }
 
-pub trait SymbolCacheObserver {
+pub trait SymsrvObserver {
     fn on_new_download_before_connect(&self, download_id: u64, url: &str);
     fn on_download_started(&self, download_id: u64);
     fn on_download_progress(&self, download_id: u64, bytes_so_far: u64, total_bytes: Option<u64>);
@@ -307,19 +307,19 @@ pub trait SymbolCacheObserver {
 static NEXT_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Obtains symbols according to the instructions in the symbol path.
-pub struct SymbolCache {
+pub struct SymsrvDownloader {
     symbol_path: Vec<NtSymbolPathEntry>,
     default_downstream_store: Option<PathBuf>,
-    observer: Option<Arc<dyn SymbolCacheObserver>>,
+    observer: Option<Arc<dyn SymsrvObserver>>,
     client: reqwest::Client,
 }
 
-impl SymbolCache {
-    /// Create a new `SymbolCache`.
+impl SymsrvDownloader {
+    /// Create a new `SymsrvDownloader`.
     pub fn new(
         symbol_path: Vec<NtSymbolPathEntry>,
         default_downstream_store: Option<&Path>,
-        observer: Option<Arc<dyn SymbolCacheObserver>>,
+        observer: Option<Arc<dyn SymsrvObserver>>,
     ) -> Self {
         let builder = reqwest::Client::builder();
 
@@ -347,7 +347,7 @@ impl SymbolCache {
 
     /// This is the primary entry point to fetch symbols. It takes a relative
     /// `path` of the form `name.pdb\HEX\name.pdb`, and then looks up the
-    /// file according to the recipe of this `SymbolCache`. That means it searches
+    /// file according to the recipe of this `SymsrvDownloader`. That means it searches
     /// cache directories, downloads symbols as needed, and uncompresses files
     /// as needed.
     ///
@@ -839,11 +839,11 @@ fn create_compressed_path(uncompressed_path: &Path) -> Result<PathBuf, Error> {
 struct DownloadStatusReporter {
     /// Set to `None` when `download_failed()` or `download_completed()` is called.
     download_id: Option<u64>,
-    observer: Option<Arc<dyn SymbolCacheObserver>>,
+    observer: Option<Arc<dyn SymsrvObserver>>,
 }
 
 impl DownloadStatusReporter {
-    pub fn new(download_id: u64, observer: Option<Arc<dyn SymbolCacheObserver>>) -> Self {
+    pub fn new(download_id: u64, observer: Option<Arc<dyn SymsrvObserver>>) -> Self {
         Self {
             download_id: Some(download_id),
             observer,
