@@ -94,16 +94,6 @@ pub enum CachePath {
 }
 
 impl CachePath {
-    pub fn try_to_path<'a>(
-        &'a self,
-        default_downstream_store: Option<&'a Path>,
-    ) -> Option<&'a Path> {
-        match self {
-            CachePath::DefaultDownstreamStore => default_downstream_store,
-            CachePath::Path(path) => Some(path),
-        }
-    }
-
     pub fn to_path<'a>(&'a self, default_downstream_store: &'a Path) -> &'a Path {
         match self {
             CachePath::DefaultDownstreamStore => default_downstream_store,
@@ -416,9 +406,7 @@ impl SymsrvDownloader {
                         // Check if the symbol file is present at this path. If found, also persist
                         // it to the previous cache paths.
                         let (_, parent_cache_paths) = parent_cache_paths.split_last().unwrap();
-                        if let Some(cache_dir) =
-                            cache_path.try_to_path(self.default_downstream_store.as_deref())
-                        {
+                        if let Some(cache_dir) = self.resolve_cache_path(cache_path) {
                             if let Some(found_path) = self
                                 .check_directory(
                                     cache_dir,
@@ -482,6 +470,13 @@ impl SymsrvDownloader {
             }
         }
         file_exists
+    }
+
+    fn resolve_cache_path<'a>(&'a self, cache_path: &'a CachePath) -> Option<&'a Path> {
+        match cache_path {
+            CachePath::Path(path) => Some(path),
+            CachePath::DefaultDownstreamStore => self.default_downstream_store.as_deref(),
+        }
     }
 
     /// Attempt to find the file on the local file system. This is done first, before any downloading
@@ -564,8 +559,8 @@ impl SymsrvDownloader {
         let (download_dest_cache, remaining_caches) = parent_caches
             .split_last()
             .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
-        let download_dest_cache_path = download_dest_cache
-            .try_to_path(self.default_downstream_store.as_deref())
+        let download_dest_cache_path = self
+            .resolve_cache_path(download_dest_cache)
             .ok_or(Error::NoDefaultDownstreamStore)?;
         let (dest_path, is_compressed) = match self
             .download_file_to_cache(
@@ -621,9 +616,7 @@ impl SymsrvDownloader {
     /// `rel_path` to create the correct destination path for each cache.
     async fn copy_file_to_caches(&self, rel_path: &Path, abs_path: &Path, caches: &[CachePath]) {
         for cache_path in caches {
-            if let Some(cache_dir) =
-                cache_path.try_to_path(self.default_downstream_store.as_deref())
-            {
+            if let Some(cache_dir) = self.resolve_cache_path(cache_path) {
                 if let Ok(dest_path) = self
                     .make_dest_path_and_ensure_parent_dirs(rel_path, cache_dir)
                     .await
@@ -663,8 +656,8 @@ impl SymsrvDownloader {
         rel_path: &Path,
         cache_path: &CachePath,
     ) -> Result<PathBuf, Error> {
-        let cache_path = cache_path
-            .try_to_path(self.default_downstream_store.as_deref())
+        let cache_path = self
+            .resolve_cache_path(cache_path)
             .ok_or(Error::NoDefaultDownstreamStore)?;
         let dest_path = self
             .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
