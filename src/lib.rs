@@ -560,7 +560,7 @@ impl SymsrvDownloader {
         let (download_dest_cache, remaining_caches) = parent_caches
             .split_last()
             .unwrap_or((&CachePath::DefaultDownstreamStore, &[]));
-        let download_dest_cache_path = self
+        let download_dest_cache_dir = self
             .resolve_cache_path(download_dest_cache)
             .ok_or(Error::NoDefaultDownstreamStore)?;
         let response_future = self.prepare_download_of_file(&full_candidate_url);
@@ -571,7 +571,7 @@ impl SymsrvDownloader {
                     notifier,
                     response,
                     rel_path_uncompressed,
-                    download_dest_cache_path,
+                    download_dest_cache_dir,
                 )
             })
             .await
@@ -583,7 +583,7 @@ impl SymsrvDownloader {
                         notifier,
                         response,
                         rel_path_compressed,
-                        download_dest_cache_path,
+                        download_dest_cache_dir,
                     )
                 })
                 .await
@@ -739,7 +739,7 @@ impl SymsrvDownloader {
         reporter: DownloadStatusReporter,
         response: reqwest::Response,
         rel_path: &Path,
-        cache_path: &Path,
+        cache_dir: &Path,
     ) -> Result<PathBuf, ()> {
         // We have a response with a success status code.
         let ts_after_status = Instant::now();
@@ -749,7 +749,7 @@ impl SymsrvDownloader {
         }
 
         let dest_path = match self
-            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
+            .make_dest_path_and_ensure_parent_dirs(rel_path, cache_dir)
             .await
         {
             Ok(dest_path) => dest_path,
