@@ -694,13 +694,10 @@ impl SymsrvDownloader {
         Ok(dest_path)
     }
 
-    /// Download the file at `url` into memory.
-    async fn download_file_to_cache(
+    async fn prepare_download_of_file(
         &self,
         url: &str,
-        rel_path: &Path,
-        cache_path: &Path,
-    ) -> Option<PathBuf> {
+    ) -> Option<(DownloadStatusReporter, reqwest::Response)> {
         let download_id = NEXT_DOWNLOAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(observer) = self.observer.as_deref() {
             observer.on_new_download_before_connect(download_id, url);
@@ -708,7 +705,6 @@ impl SymsrvDownloader {
 
         let reporter = DownloadStatusReporter::new(download_id, self.observer.clone());
 
-        let time_before_connect = Instant::now();
         let response_result = self
             .client
             .get(url)
@@ -725,8 +721,21 @@ impl SymsrvDownloader {
             }
         };
 
+        Some((reporter, response))
+    }
+
+    /// Download the file at `url` into memory.
+    async fn download_file_to_cache(
+        &self,
+        url: &str,
+        rel_path: &Path,
+        cache_path: &Path,
+    ) -> Option<PathBuf> {
+        let (reporter, response) = self.prepare_download_of_file(url).await?;
+
         // We have a response with a success status code.
-        let time_after_status = Instant::now();
+        let ts_after_status = Instant::now();
+        let download_id = reporter.download_id();
         if let Some(observer) = self.observer.as_deref() {
             observer.on_download_started(download_id);
         }
@@ -779,11 +788,11 @@ impl SymsrvDownloader {
             }
         };
 
-        let time_after_download = Instant::now();
+        let ts_after_download = Instant::now();
         reporter.download_completed(
             uncompressed_size_in_bytes,
-            time_after_status.duration_since(time_before_connect),
-            time_after_download.duration_since(time_before_connect),
+            ts_after_status,
+            ts_after_download,
         );
 
         if let Some(observer) = self.observer.as_deref() {
@@ -833,6 +842,7 @@ struct DownloadStatusReporter {
     /// Set to `None` when `download_failed()` or `download_completed()` is called.
     download_id: Option<u64>,
     observer: Option<Arc<dyn SymsrvObserver>>,
+    ts_before_connect: Instant,
 }
 
 impl DownloadStatusReporter {
@@ -840,7 +850,12 @@ impl DownloadStatusReporter {
         Self {
             download_id: Some(download_id),
             observer,
+            ts_before_connect: Instant::now(),
         }
+    }
+
+    pub fn download_id(&self) -> u64 {
+        self.download_id.unwrap()
     }
 
     pub fn download_failed(mut self, e: DownloadError) {
@@ -854,10 +869,12 @@ impl DownloadStatusReporter {
     pub fn download_completed(
         mut self,
         uncompressed_size_in_bytes: u64,
-        time_until_headers: Duration,
-        time_until_completed: Duration,
+        ts_after_headers: Instant,
+        ts_after_completed: Instant,
     ) {
         if let (Some(download_id), Some(observer)) = (self.download_id, self.observer.as_deref()) {
+            let time_until_headers = ts_after_headers.duration_since(self.ts_before_connect);
+            let time_until_completed = ts_after_completed.duration_since(self.ts_before_connect);
             observer.on_download_completed(
                 download_id,
                 uncompressed_size_in_bytes,
