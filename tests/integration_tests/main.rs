@@ -436,25 +436,25 @@ async fn test_aborted_response() {
     );
     assert_eq!(
         observer.failed_downloads[0].0,
-        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_",
-        "Should have failed to download the compressed file"
-    );
-    assert!(
-        matches!(
-            observer.failed_downloads[0].1,
-            DownloadError::StatusError(StatusCode::NOT_FOUND)
-        ),
-        "Should have failed with the appropriate error"
-    );
-    assert_eq!(
-        observer.failed_downloads[1].0,
         server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
         "Should have failed to download the uncompressed file"
     );
     assert!(
         matches!(
-            observer.failed_downloads[1].1,
+            observer.failed_downloads[0].1,
             DownloadError::ErrorDuringDownloading(_)
+        ),
+        "Should have failed with the appropriate error"
+    );
+    assert_eq!(
+        observer.failed_downloads[1].0,
+        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_",
+        "Should have failed to download the compressed file"
+    );
+    assert!(
+        matches!(
+            observer.failed_downloads[1].1,
+            DownloadError::StatusError(StatusCode::NOT_FOUND)
         ),
         "Should have failed with the appropriate error"
     );

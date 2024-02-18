@@ -564,22 +564,22 @@ impl SymsrvDownloader {
             .ok_or(Error::NoDefaultDownstreamStore)?;
         let (dest_path, is_compressed) = match self
             .download_file_to_cache(
-                &full_candidate_url_compr,
-                rel_path_compressed,
+                &full_candidate_url,
+                rel_path_uncompressed,
                 download_dest_cache_path,
             )
             .await
         {
-            Some(dest_path) => (dest_path, true),
+            Some(dest_path) => (dest_path, false),
             None => match self
                 .download_file_to_cache(
-                    &full_candidate_url,
-                    rel_path_uncompressed,
+                    &full_candidate_url_compr,
+                    rel_path_compressed,
                     download_dest_cache_path,
                 )
                 .await
             {
-                Some(dest_path) => (dest_path, false),
+                Some(dest_path) => (dest_path, true),
                 None => return Ok(None),
             },
         };
