@@ -471,8 +471,12 @@ impl SymsrvDownloader {
                     while let Some(next_response) = response_futures.next().await {
                         let (prepared_response, rel_path, is_compressed) = next_response;
                         let Some((notifier, response)) = prepared_response else {
+                            // The request failed. Try the next URL.
                             continue;
                         };
+
+                        // If we get here, the response headers indicated a success HTTP status.
+                        // Proceed to download the file.
                         let Some(dest_path) = self
                             .download_file_to_cache(
                                 notifier,
