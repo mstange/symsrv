@@ -450,29 +450,18 @@ async fn test_aborted_response() {
         2,
         "Should have two failed downloads"
     );
-    assert_eq!(
-        observer.failed_downloads[0].0,
-        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        "Should have failed to download the uncompressed file"
+    // The requests run in parallel, so we don't know which error will be reported first.
+    assert!(
+        observer.failed_downloads.iter().any(|(url, err)| url
+            == &(server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")
+            && matches!(err, DownloadError::ErrorDuringDownloading(_))),
+        "Should have failed to download the uncompressed file with the appropriate error"
     );
     assert!(
-        matches!(
-            observer.failed_downloads[0].1,
-            DownloadError::ErrorDuringDownloading(_)
-        ),
-        "Should have failed with the appropriate error"
-    );
-    assert_eq!(
-        observer.failed_downloads[1].0,
-        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_",
-        "Should have failed to download the compressed file"
-    );
-    assert!(
-        matches!(
-            observer.failed_downloads[1].1,
-            DownloadError::StatusError(StatusCode::NOT_FOUND)
-        ),
-        "Should have failed with the appropriate error"
+        observer.failed_downloads.iter().any(|(url, err)| url
+            == &(server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_")
+            && matches!(err, DownloadError::StatusError(StatusCode::NOT_FOUND))),
+        "Should have failed to download the compressed file with the appropriate error"
     );
 }
 
