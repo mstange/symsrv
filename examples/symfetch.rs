@@ -94,12 +94,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    let observer = Arc::new(SymFetchObserver::new());
+
     let symbol_cache = SymsrvDownloader::new(
         parsed_nt_symbol_path,
         args.default_downstream_store
             .or(get_default_downstream_store())
             .as_deref(),
-        Some(Arc::new(SymFetchObserver::new())),
+        Some(observer),
     );
 
     let path: PathBuf = [args.name.clone(), args.hash, args.name].iter().collect();
@@ -193,7 +195,9 @@ impl SymFetchObserverInner {
         request.progress_bar.finish_and_clear();
         self.multi_progress.remove(&request.progress_bar);
         let url = request.url;
-        eprintln!("Request to {url} failed: {error}");
+        self.multi_progress
+            .println(format!("Request to {url} failed: {error}"))
+            .unwrap();
     }
 
     fn message_for_url(url: &str) -> String {
@@ -243,13 +247,15 @@ impl SymFetchObserverInner {
 
     fn on_download_completed(&mut self, download_id: u64, uncompressed_size_in_bytes: u64) {
         let request = self.requests.remove(&download_id).unwrap();
-        request.progress_bar.finish_and_clear();
+        request.progress_bar.finish();
         self.multi_progress.remove(&request.progress_bar);
         let url = request.url;
-        eprintln!(
-            "Successfully downloaded {} from {url}.",
-            DecimalBytes(uncompressed_size_in_bytes)
-        );
+        self.multi_progress
+            .println(format!(
+                "Successfully downloaded {} from {url}.",
+                DecimalBytes(uncompressed_size_in_bytes)
+            ))
+            .unwrap();
     }
 }
 
