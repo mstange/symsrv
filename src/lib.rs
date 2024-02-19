@@ -240,9 +240,6 @@ pub enum DownloadError {
     #[error("The response used an unexpected Content-Encoding: {0}")]
     UnexpectedContentEncoding(String),
 
-    #[error("The download was cancelled by dropping the future")]
-    FutureDropped,
-
     #[error("Error during downloading: {0}")]
     ErrorDuringDownloading(std::io::Error),
 
@@ -291,6 +288,7 @@ pub trait SymsrvObserver {
         time_until_completed: Duration,
     );
     fn on_download_failed(&self, download_id: u64, reason: DownloadError);
+    fn on_download_canceled(&self, download_id: u64);
     fn on_file_created(&self, path: &Path, size_in_bytes: u64);
     fn on_file_accessed(&self, path: &Path);
     fn on_file_missed(&self, path: &Path);
@@ -894,7 +892,7 @@ impl Drop for DownloadStatusReporter {
             // We were dropped before a call to `download_failed` or `download_completed`.
             // This was most likely because the future we were stored in was dropped.
             // Tell the observer.
-            observer.on_download_failed(download_id, DownloadError::FutureDropped);
+            observer.on_download_canceled(download_id);
         }
     }
 }

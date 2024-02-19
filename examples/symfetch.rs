@@ -136,6 +136,10 @@ impl SymsrvObserver for SymFetchObserver {
         self.get_inner().on_download_failed(download_id, error);
     }
 
+    fn on_download_canceled(&self, download_id: u64) {
+        self.get_inner().on_download_canceled(download_id);
+    }
+
     fn on_download_started(&self, download_id: u64) {
         self.get_inner().on_download_started(download_id);
     }
@@ -197,6 +201,16 @@ impl SymFetchObserverInner {
         let url = request.url;
         self.multi_progress
             .println(format!("Request to {url} failed: {error}"))
+            .unwrap();
+    }
+
+    fn on_download_canceled(&mut self, download_id: u64) {
+        let request = self.requests.remove(&download_id).unwrap();
+        request.progress_bar.finish_and_clear();
+        self.multi_progress.remove(&request.progress_bar);
+        let url = request.url;
+        self.multi_progress
+            .println(format!("Canceled request to {url}."))
             .unwrap();
     }
 

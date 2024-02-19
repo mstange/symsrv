@@ -517,16 +517,9 @@ async fn test_dropped_future() {
     // future is dropped.
     let observer = observer.get_inner();
     assert_ne!(
-        observer.failed_downloads.len(),
+        observer.canceled_downloads.len(),
         0,
-        "Should at least one failed download"
-    );
-    assert!(
-        matches!(
-            observer.failed_downloads.last().unwrap().1,
-            DownloadError::FutureDropped
-        ),
-        "Should have failed with a FutureDropped error"
+        "Should at least one canceled download"
     );
 }
 
@@ -617,6 +610,7 @@ struct TestObserverInner {
     pending_downloads: HashMap<u64, String>,
     completed_downloads: Vec<String>,
     failed_downloads: Vec<(String, DownloadError)>,
+    canceled_downloads: Vec<String>,
     missed_files: Vec<PathBuf>,
     created_files: Vec<(PathBuf, u64)>,
     accessed_files: Vec<PathBuf>,
@@ -630,6 +624,11 @@ impl TestObserverInner {
     fn on_download_failed(&mut self, download_id: u64, error: DownloadError) {
         let url = self.pending_downloads.remove(&download_id).unwrap();
         self.failed_downloads.push((url, error));
+    }
+
+    fn on_download_canceled(&mut self, download_id: u64) {
+        let url = self.pending_downloads.remove(&download_id).unwrap();
+        self.canceled_downloads.push(url);
     }
 
     fn on_download_completed(
@@ -675,6 +674,10 @@ impl SymsrvObserver for TestObserver {
 
     fn on_download_failed(&self, download_id: u64, error: DownloadError) {
         self.get_inner().on_download_failed(download_id, error);
+    }
+
+    fn on_download_canceled(&self, download_id: u64) {
+        self.get_inner().on_download_canceled(download_id);
     }
 
     fn on_download_started(&self, _download_id: u64) {}
