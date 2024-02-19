@@ -223,6 +223,10 @@ impl From<CleanFileCreationError<Error>> for Error {
 /// The error type used in the observer notification [`SymsrvObserver::on_download_failed`].
 #[derive(thiserror::Error, Debug)]
 pub enum DownloadError {
+    /// Creating the reqwest Client failed.
+    #[error("Creating the client failed: {0}")]
+    ClientCreationFailed(String),
+
     /// Opening the request failed.
     #[error("Opening the request failed")]
     OpenFailed,
@@ -373,7 +377,7 @@ pub struct SymsrvDownloader {
     symbol_path: Vec<NtSymbolPathEntry>,
     default_downstream_store: Option<PathBuf>,
     observer: Option<Arc<dyn SymsrvObserver>>,
-    client: reqwest::Client,
+    reqwest_client: Result<reqwest::Client, reqwest::Error>,
 }
 
 #[cfg(test)]
@@ -430,14 +434,13 @@ impl SymsrvDownloader {
 
         // Create the client.
         // TODO: Add timeouts, user agent, maybe other settings
-        // TODO: Propagate error
-        let client = builder.build().unwrap();
+        let client = builder.build();
 
         Self {
             symbol_path,
             default_downstream_store: default_downstream_store.map(ToOwned::to_owned),
             observer,
-            client,
+            reqwest_client: client,
         }
     }
 
@@ -846,7 +849,15 @@ impl SymsrvDownloader {
 
         let reporter = DownloadStatusReporter::new(download_id, self.observer.clone());
 
-        let request_builder = self.client.get(url);
+        let reqwest_client = match self.reqwest_client.as_ref() {
+            Ok(client) => client,
+            Err(e) => {
+                reporter.download_failed(DownloadError::ClientCreationFailed(e.to_string()));
+                return None;
+            }
+        };
+
+        let request_builder = reqwest_client.get(url);
 
         // Manually specify the Accept-Encoding header.
         // This would happen automatically if we hadn't turned off automatic
