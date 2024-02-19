@@ -791,17 +791,23 @@ impl SymsrvDownloader {
 
         let reporter = DownloadStatusReporter::new(download_id, self.observer.clone());
 
-        let response_result = self
-            .client
-            .get(url)
-            .header("Accept-Encoding", "gzip")
-            .send()
-            .await
-            .and_then(|response| response.error_for_status());
+        let request_builder = self.client.get(url);
+
+        // Manually specify the Accept-Encoding header.
+        // This would happen automatically if we hadn't turned off automatic
+        // decompression for this reqwest client.
+        let request_builder = request_builder.header("Accept-Encoding", "gzip");
+
+        // Send the request and wait for the headers.
+        let response_result = request_builder.send().await;
+
+        // Check the HTTP status code.
+        let response_result = response_result.and_then(|response| response.error_for_status());
 
         let response = match response_result {
             Ok(response) => response,
             Err(e) => {
+                // The request failed, most commonly due to a 404 status code.
                 reporter.download_failed(DownloadError::from(e));
                 return None;
             }
