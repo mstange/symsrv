@@ -130,6 +130,22 @@ impl TestSymbolServer {
         self.mocks.push(mock);
     }
 
+    pub fn add_mock_with_slow_chunked_response(&mut self, rel_path: &str, chunk_size: usize) {
+        let body = std::fs::read(path_to_fixture(rel_path)).unwrap();
+        let mock = self
+            .server
+            .mock("GET", format!("/{rel_path}").as_str())
+            .with_chunked_body(move |w| {
+                for chunk in body.chunks(chunk_size) {
+                    w.write_all(chunk).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(())
+            })
+            .create();
+        self.mocks.push(mock);
+    }
+
     pub fn url(&self) -> String {
         self.server.url()
     }
@@ -469,8 +485,11 @@ async fn test_dropped_future() {
     let cache1 = TestCacheDir::prepare(&[]).unwrap();
 
     // The server has a single, uncompressed, file.
-    let server1 =
-        TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).await;
+    let mut server1 = TestSymbolServer::prepare(&[]).await;
+    server1.add_mock_with_slow_chunked_response(
+        "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
+        1000,
+    );
 
     let (symbol_cache, observer) = make_symbol_cache(
         vec![NtSymbolPathEntry::Chain {
