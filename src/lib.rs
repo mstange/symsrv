@@ -469,51 +469,53 @@ impl SymsrvDownloader {
                     // the file to the previous cache paths.
                     let mut response_futures = PollAllPreservingOrder::new(response_futures);
                     while let Some(next_response) = response_futures.next().await {
-                        if let (Ok((notifier, response)), rel_path, is_compressed) = next_response {
-                            if let Ok(dest_path) = self
-                                .download_file_to_cache(
-                                    notifier,
-                                    response,
-                                    rel_path,
-                                    download_dest_cache_dir,
-                                )
-                                .await
+                        let (prepared_response, rel_path, is_compressed) = next_response;
+                        let Some((notifier, response)) = prepared_response else {
+                            continue;
+                        };
+                        let Some(dest_path) = self
+                            .download_file_to_cache(
+                                notifier,
+                                response,
+                                rel_path,
+                                download_dest_cache_dir,
+                            )
+                            .await
+                        else {
+                            continue;
+                        };
+
+                        // We have a file!
+                        let uncompressed_dest_path = if is_compressed {
+                            if let Some((_remaining_bottom_cache, remaining_mid_level_caches)) =
+                                remaining_caches.split_first()
                             {
-                                // We have a file!
-                                let uncompressed_dest_path = if is_compressed {
-                                    if let Some((
-                                        _remaining_bottom_cache,
-                                        remaining_mid_level_caches,
-                                    )) = remaining_caches.split_first()
-                                    {
-                                        // Save the compressed file to the mid-level caches.
-                                        self.copy_file_to_caches(
-                                            &rel_path_compressed,
-                                            &dest_path,
-                                            remaining_mid_level_caches,
-                                        )
-                                        .await;
-                                    }
-                                    // Extract the file into the bottom cache.
-                                    self.extract_to_file_in_cache(
-                                        &dest_path,
-                                        rel_path_uncompressed,
-                                        bottom_cache,
-                                    )
-                                    .await?
-                                } else {
-                                    // The file is not compressed. Just copy to the other caches.
-                                    self.copy_file_to_caches(
-                                        rel_path_uncompressed,
-                                        &dest_path,
-                                        remaining_caches,
-                                    )
-                                    .await;
-                                    dest_path
-                                };
-                                return Ok(uncompressed_dest_path);
+                                // Save the compressed file to the mid-level caches.
+                                self.copy_file_to_caches(
+                                    &rel_path_compressed,
+                                    &dest_path,
+                                    remaining_mid_level_caches,
+                                )
+                                .await;
                             }
-                        }
+                            // Extract the file into the bottom cache.
+                            self.extract_to_file_in_cache(
+                                &dest_path,
+                                rel_path_uncompressed,
+                                bottom_cache,
+                            )
+                            .await?
+                        } else {
+                            // The file is not compressed. Just copy to the other caches.
+                            self.copy_file_to_caches(
+                                rel_path_uncompressed,
+                                &dest_path,
+                                remaining_caches,
+                            )
+                            .await;
+                            dest_path
+                        };
+                        return Ok(uncompressed_dest_path);
                     }
                 }
                 NtSymbolPathEntry::LocalOrShare(dir_path) => {
@@ -697,7 +699,7 @@ impl SymsrvDownloader {
     async fn prepare_download_of_file(
         &self,
         url: &str,
-    ) -> Result<(DownloadStatusReporter, reqwest::Response), ()> {
+    ) -> Option<(DownloadStatusReporter, reqwest::Response)> {
         let download_id = NEXT_DOWNLOAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(observer) = self.observer.as_deref() {
             observer.on_new_download_before_connect(download_id, url);
@@ -717,11 +719,11 @@ impl SymsrvDownloader {
             Ok(response) => response,
             Err(e) => {
                 reporter.download_failed(DownloadError::from(e));
-                return Err(());
+                return None;
             }
         };
 
-        Ok((reporter, response))
+        Some((reporter, response))
     }
 
     /// Download the file at `url` into memory.
@@ -731,7 +733,7 @@ impl SymsrvDownloader {
         response: reqwest::Response,
         rel_path: &Path,
         cache_dir: &Path,
-    ) -> Result<PathBuf, ()> {
+    ) -> Option<PathBuf> {
         // We have a response with a success status code.
         let ts_after_status = Instant::now();
         let download_id = reporter.download_id();
@@ -746,7 +748,7 @@ impl SymsrvDownloader {
             Ok(dest_path) => dest_path,
             Err(_e) => {
                 reporter.download_failed(DownloadError::CouldNotCreateDestinationDirectory);
-                return Err(());
+                return None;
             }
         };
 
@@ -762,7 +764,7 @@ impl SymsrvDownloader {
             Ok(stream) => stream,
             Err(download::Error::UnexpectedContentEncoding(encoding)) => {
                 reporter.download_failed(DownloadError::UnexpectedContentEncoding(encoding));
-                return Err(());
+                return None;
             }
         };
 
@@ -779,11 +781,11 @@ impl SymsrvDownloader {
             Ok(size) => size,
             Err(CleanFileCreationError::CallbackIndicatedError(e)) => {
                 reporter.download_failed(DownloadError::ErrorDuringDownloading(e));
-                return Err(());
+                return None;
             }
             Err(e) => {
                 reporter.download_failed(DownloadError::ErrorWhileWritingDownloadedFile(e.into()));
-                return Err(());
+                return None;
             }
         };
 
@@ -798,7 +800,7 @@ impl SymsrvDownloader {
             observer.on_file_created(&dest_path, uncompressed_size_in_bytes);
         }
 
-        Ok(dest_path)
+        Some(dest_path)
     }
 }
 
