@@ -45,6 +45,7 @@
 mod download;
 mod file_creation;
 mod poll_all;
+mod remotely_fed_cursor;
 
 use std::io::{BufReader, Read, Seek, Write};
 use std::ops::Deref;
@@ -53,9 +54,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_compat::CompatExt;
 use file_creation::{create_file_cleanly, CleanFileCreationError};
+use futures_util::{future, AsyncReadExt};
 use poll_all::PollAllPreservingOrder;
+use remotely_fed_cursor::{RemotelyFedCursor, RemotelyFedCursorFeeder};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
@@ -641,37 +643,33 @@ impl SymsrvDownloader {
                     for server_url in urls {
                         file_urls.push((
                             url_join(server_url, rel_path_uncompressed.components()),
-                            rel_path_uncompressed,
                             false,
                         ));
-                        file_urls.push((
-                            url_join(server_url, rel_path_compressed.components()),
-                            &rel_path_compressed,
-                            true,
-                        ));
+                        file_urls
+                            .push((url_join(server_url, rel_path_compressed.components()), true));
                     }
 
                     // Prepare requests to all candidate URLs.
                     let response_futures: Vec<_> = file_urls
                         .into_iter()
-                        .map(|(file_url, rel_path, is_compressed)| async move {
+                        .map(|(file_url, is_compressed)| async move {
                             (
                                 self.prepare_download_of_file(&file_url).await,
-                                rel_path,
                                 is_compressed,
                             )
                         })
                         .map(Box::pin)
                         .collect();
+
                     // Start all requests and wait for the first successful response, then cancel
                     // all other requests by dropping the array of futures.
-                    let Some((notifier, response, rel_path, is_compressed)) = async {
+                    let Some((notifier, response, is_compressed)) = async {
                         let mut response_futures = PollAllPreservingOrder::new(response_futures);
                         while let Some(next_response) = response_futures.next().await {
-                            let (prepared_response, rel_path, is_compressed) = next_response;
+                            let (prepared_response, is_compressed) = next_response;
                             if let Some((notifier, response)) = prepared_response {
                                 // This request returned a success status from the server.
-                                return Some((notifier, response, rel_path, is_compressed));
+                                return Some((notifier, response, is_compressed));
                             };
                         }
                         None
@@ -685,24 +683,32 @@ impl SymsrvDownloader {
 
                     // If we get here, we have a response with a success HTTP status.
                     // Download the file. If successful, also persist the file to the previous cache paths.
-                    let Some(dest_path) = self
-                        .download_file_to_cache(
+
+                    let uncompressed_dest_path = if is_compressed {
+                        let (rx, tx) = remotely_fed_cursor::create_cursor_channel();
+                        let download_dest_path_future = self.download_file_to_cache(
                             notifier,
                             response,
-                            rel_path,
+                            &rel_path_compressed,
                             download_dest_cache_dir,
-                        )
-                        .await
-                    else {
-                        continue;
-                    };
+                            Some(tx),
+                        );
+                        let extraction_result_future = self.extract_to_file_in_cache(
+                            CabDataSource::Cursor(rx),
+                            rel_path_uncompressed,
+                            bottom_cache,
+                        );
+                        let (download_dest_path, extraction_result) =
+                            future::join(download_dest_path_future, extraction_result_future).await;
+                        let Some(dest_path) = download_dest_path else {
+                            continue;
+                        };
 
-                    // We have a file!
-                    let uncompressed_dest_path = if is_compressed {
+                        // We have a file!
                         if let Some((_remaining_bottom_cache, remaining_mid_level_caches)) =
                             remaining_caches.split_first()
                         {
-                            // Save the compressed file to the mid-level caches.
+                            // Copy the compressed file to the mid-level caches.
                             self.copy_file_to_caches(
                                 &rel_path_compressed,
                                 &dest_path,
@@ -710,14 +716,21 @@ impl SymsrvDownloader {
                             )
                             .await;
                         }
-                        // Extract the file into the bottom cache.
-                        self.extract_to_file_in_cache(
-                            &dest_path,
-                            rel_path_uncompressed,
-                            bottom_cache,
-                        )
-                        .await?
+
+                        // Return the path to the uncompressed file in the bottom cache.
+                        extraction_result?
                     } else {
+                        let dest_path = self
+                            .download_file_to_cache(
+                                notifier,
+                                response,
+                                rel_path_uncompressed,
+                                download_dest_cache_dir,
+                                None,
+                            )
+                            .await;
+                        let Some(dest_path) = dest_path else { continue };
+
                         // The file is not compressed. Just copy to the other caches.
                         self.copy_file_to_caches(
                             rel_path_uncompressed,
@@ -807,12 +820,16 @@ impl SymsrvDownloader {
                 // into the bottom-most cache.
                 self.copy_file_to_caches(rel_path_compressed, &abs_path, mid_level_caches)
                     .await;
-                self.extract_to_file_in_cache(&abs_path, rel_path_uncompressed, bottom_most_cache)
-                    .await?
+                self.extract_to_file_in_cache(
+                    CabDataSource::Filename(abs_path.clone()),
+                    rel_path_uncompressed,
+                    bottom_most_cache,
+                )
+                .await?
             } else {
                 // We have no cache. Extract it into the default downstream cache.
                 self.extract_to_file_in_cache(
-                    &abs_path,
+                    CabDataSource::Filename(abs_path.clone()),
                     rel_path_uncompressed,
                     &CachePath::DefaultDownstreamStore,
                 )
@@ -865,7 +882,7 @@ impl SymsrvDownloader {
     /// directory.
     async fn extract_to_file_in_cache(
         &self,
-        compressed_input_path: &Path,
+        cab_data_source: CabDataSource,
         rel_path: &Path,
         cache_path: &CachePath,
     ) -> Result<PathBuf, Error> {
@@ -875,7 +892,6 @@ impl SymsrvDownloader {
         let dest_path = self
             .make_dest_path_and_ensure_parent_dirs(rel_path, cache_path)
             .await?;
-        let compressed_input_path = compressed_input_path.to_owned();
 
         let notifier = {
             let observer = self.observer.clone();
@@ -893,11 +909,16 @@ impl SymsrvDownloader {
             create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
                 {
                     let mut dest_file = dest_file.into_std().await;
-                    tokio::task::spawn_blocking(move || {
-                        let file = std::fs::File::open(compressed_input_path)
-                            .map_err(CabExtractionError::CouldNotOpenCabFile)?;
-                        let buf_read = BufReader::new(file);
-                        extract_cab_to_file(extraction_id, buf_read, &mut dest_file, observer)
+                    tokio::task::spawn_blocking(move || match cab_data_source {
+                        CabDataSource::Filename(compressed_input_path) => {
+                            let file = std::fs::File::open(compressed_input_path)
+                                .map_err(CabExtractionError::CouldNotOpenCabFile)?;
+                            let buf_read = BufReader::new(file);
+                            extract_cab_to_file(extraction_id, buf_read, &mut dest_file, observer)
+                        }
+                        CabDataSource::Cursor(cursor) => {
+                            extract_cab_to_file(extraction_id, cursor, &mut dest_file, observer)
+                        }
                     })
                     .await
                     .expect("task panicked")
@@ -974,13 +995,14 @@ impl SymsrvDownloader {
         Some((reporter, response))
     }
 
-    /// Download the file at `url` into memory.
+    /// Download the file at `url` to a file in `cache_dir``.
     async fn download_file_to_cache(
         &self,
         reporter: DownloadStatusReporter,
         response: reqwest::Response,
         rel_path: &Path,
         cache_dir: &Path,
+        mut chunk_consumer: Option<RemotelyFedCursorFeeder>,
     ) -> Option<PathBuf> {
         // We have a response with a success status code.
         let ts_after_status = Instant::now();
@@ -1018,8 +1040,23 @@ impl SymsrvDownloader {
 
         let download_result: Result<u64, CleanFileCreationError<std::io::Error>> =
             create_file_cleanly(&dest_path, |mut dest_file: tokio::fs::File| async move {
-                let uncompressed_size_in_bytes =
-                    futures::io::copy(&mut stream, &mut dest_file.compat_mut()).await?;
+                let mut buf = vec![0u8; 4096];
+                let mut uncompressed_size_in_bytes = 0;
+                loop {
+                    let count = stream.read(&mut buf).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    uncompressed_size_in_bytes += count as u64;
+                    dest_file.write_all(&buf[..count]).await?;
+
+                    if let Some(chunk_consumer) = &mut chunk_consumer {
+                        chunk_consumer.feed(&buf[..count]);
+                    }
+                }
+                if let Some(chunk_consumer) = &mut chunk_consumer {
+                    chunk_consumer.mark_complete();
+                }
                 dest_file.flush().await?;
                 Ok(uncompressed_size_in_bytes)
             })
@@ -1050,6 +1087,11 @@ impl SymsrvDownloader {
 
         Some(dest_path)
     }
+}
+
+enum CabDataSource {
+    Filename(PathBuf),
+    Cursor(RemotelyFedCursor),
 }
 
 fn get_first_file_entry<R: Read + Seek>(cabinet: &mut cab::Cabinet<R>) -> Option<(String, u64)> {
