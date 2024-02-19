@@ -286,7 +286,7 @@ impl From<reqwest::Error> for DownloadError {
 
 /// A trait for observing the behavior of a `SymsrvDownloader`.
 /// This can be used for logging, displaying progress bars, expiring cached files, etc.
-pub trait SymsrvObserver {
+pub trait SymsrvObserver: Send + Sync + 'static {
     /// Called when a new download is about to start, before the connection is established.
     ///
     /// The download ID is unique for each download.
@@ -372,6 +372,15 @@ pub struct SymsrvDownloader {
     default_downstream_store: Option<PathBuf>,
     observer: Option<Arc<dyn SymsrvObserver>>,
     client: reqwest::Client,
+}
+
+#[cfg(test)]
+#[test]
+fn test_symsrv_downloader_error_is_send_and_sync() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<SymsrvDownloader>();
+    assert_sync::<SymsrvDownloader>();
 }
 
 impl SymsrvDownloader {
