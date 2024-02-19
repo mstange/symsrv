@@ -41,6 +41,7 @@
 
 mod download;
 mod file_creation;
+mod poll_all;
 
 use std::io::BufReader;
 use std::ops::Deref;
@@ -51,6 +52,7 @@ use std::time::Duration;
 
 use async_compat::CompatExt;
 use file_creation::{create_file_cleanly, CleanFileCreationError};
+use poll_all::PollAllPreservingOrder;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
@@ -453,24 +455,23 @@ impl SymsrvDownloader {
 
                     // Prepare requests to all candidate URLs. We are not actually starting these requests
                     // yet because we're not calling poll on the futures until we hit the await call in the loop below.
-                    let response_futures: Vec<_> =
-                        file_urls
-                            .into_iter()
-                            .map(|(file_url, rel_path, is_compressed)| async move {
-                                let (notifier, response) =
-                                    self.prepare_download_of_file(&file_url).await?;
-                                Ok::<(DownloadStatusReporter, reqwest::Response, &Path, bool), ()>(
-                                    (notifier, response, rel_path, is_compressed),
-                                )
-                            })
-                            .collect();
+                    let response_futures: Vec<_> = file_urls
+                        .into_iter()
+                        .map(|(file_url, rel_path, is_compressed)| async move {
+                            (
+                                self.prepare_download_of_file(&file_url).await,
+                                rel_path,
+                                is_compressed,
+                            )
+                        })
+                        .map(Box::pin)
+                        .collect();
 
                     // Download the symbol file from the candidate URLs we've computed. If successful, also persist
                     // the file to the previous cache paths.
-                    for response_future in response_futures {
-                        if let Ok((notifier, response, rel_path, is_compressed)) =
-                            response_future.await
-                        {
+                    let mut response_futures = PollAllPreservingOrder::new(response_futures);
+                    while let Some(next_response) = response_futures.next().await {
+                        if let (Ok((notifier, response)), rel_path, is_compressed) = next_response {
                             if let Ok(dest_path) = self
                                 .download_file_to_cache(
                                     notifier,
