@@ -18,18 +18,19 @@
 //!
 //! ```
 //! use std::path::PathBuf;
-//! use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymsrvDownloader};
+//! use symsrv::SymsrvDownloader;
 //!
 //! # fn open_pdb_at_path(p: &std::path::Path) {}
 //! #
 //! # async fn wrapper() -> Result<(), symsrv::Error> {
 //! // Parse the _NT_SYMBOL_PATH environment variable.
-//! let symbol_path =
-//!     get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
+//! let symbol_path_env = symsrv::get_symbol_path_from_environment();
+//! let symbol_path = symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
+//! let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
-//! let default_downstream = get_default_downstream_store(); // "~/sym"
-//! let downloader = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
+//! let default_downstream = symsrv::get_default_downstream_store(); // "~/sym"
+//! let downloader = SymsrvDownloader::new(parsed_symbol_path, default_downstream.as_deref(), None);
 //!
 //! // Download and cache a PDB file.
 //! let local_path = downloader.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
@@ -122,15 +123,9 @@ pub fn get_default_downstream_store() -> Option<PathBuf> {
     Some(home_dir.join("sym"))
 }
 
-/// Reads the `_NT_SYMBOL_PATH` environment variable and parses it.
-/// The parsed path entries use ~/sym as the default downstream store.
-pub fn get_symbol_path_from_environment(fallback_if_unset: &str) -> Vec<NtSymbolPathEntry> {
-    parse_nt_symbol_path(
-        std::env::var("_NT_SYMBOL_PATH")
-            .ok()
-            .as_deref()
-            .unwrap_or(fallback_if_unset),
-    )
+/// Reads the `_NT_SYMBOL_PATH` environment variable into a string.
+pub fn get_symbol_path_from_environment() -> Option<String> {
+    std::env::var("_NT_SYMBOL_PATH").ok()
 }
 
 /// Parse the value of the `_NT_SYMBOL_PATH` variable. The format of this variable
@@ -408,11 +403,14 @@ impl SymsrvDownloader {
     ///
     /// ```
     /// use std::path::Path;
-    /// use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymsrvDownloader};
+    /// use symsrv::SymsrvDownloader;
     ///
-    /// let symbol_path = get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
-    /// let default_downstream = get_default_downstream_store(); // "~/sym"
-    /// let downloader = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
+    /// let symbol_path_env = symsrv::get_symbol_path_from_environment();
+    /// let symbol_path = symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
+    /// let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
+    ///
+    /// let default_downstream = symsrv::get_default_downstream_store(); // "~/sym"
+    /// let downloader = SymsrvDownloader::new(parsed_symbol_path, default_downstream.as_deref(), None);
     /// ```
     pub fn new(
         symbol_path: Vec<NtSymbolPathEntry>,
