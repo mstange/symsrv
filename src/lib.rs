@@ -434,6 +434,21 @@ impl SymsrvDownloader {
     /// The binary hash (the "code ID") can be created using
     /// [`wholesym::PeCodeId`](https://docs.rs/wholesym/latest/wholesym/struct.PeCodeId.html).
     pub async fn get_file(&self, filename: &str, hash: &str) -> Result<PathBuf, Error> {
+        self.get_file_impl(filename, hash, true).await
+    }
+
+    /// Same as [`get_file`](Self::get_file), but only checks cache directories.
+    /// No downloads are attempted.
+    pub async fn get_file_no_download(&self, filename: &str, hash: &str) -> Result<PathBuf, Error> {
+        self.get_file_impl(filename, hash, false).await
+    }
+
+    pub async fn get_file_impl(
+        &self,
+        filename: &str,
+        hash: &str,
+        allow_downloads: bool,
+    ) -> Result<PathBuf, Error> {
         let path: PathBuf = [filename, hash, filename].iter().collect();
         let rel_path_uncompressed = &path;
         let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
@@ -503,6 +518,10 @@ impl SymsrvDownloader {
 
                     // The symbol file was not found in any of the cache paths. Try to download it
                     // from the server URLs in this entry.
+                    if !allow_downloads {
+                        // We're not allowed to download anything. Go to the next entry.
+                        continue;
+                    }
 
                     // First, make sure we have a place to download to.
                     let (download_dest_cache, remaining_caches) = parent_cache_paths

@@ -263,6 +263,33 @@ async fn test_simple_available() {
 }
 
 #[tokio::test]
+async fn test_simple_available_no_download() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+    let cache1 =
+        TestCacheDir::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).unwrap();
+    let (symbol_cache, _) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![],
+        }],
+        Some(default_downstream.path()),
+    );
+    let res = symbol_cache
+        .get_file_no_download("ShowSSEConfig.exe", "63E6C7F78000")
+        .await;
+    assert!(
+        res.is_ok(),
+        "Should find a symbol file in a pre-populated cache"
+    );
+    let path = res.unwrap();
+    assert!(
+        file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "Should find a symbol file in a pre-populated cache"
+    );
+}
+
+#[tokio::test]
 async fn test_simple_compressed() {
     let default_downstream = TestCacheDir::prepare(&[]).unwrap();
 
@@ -394,6 +421,38 @@ async fn test_simple_server() {
     assert!(
         cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should be stored in the cache."
+    );
+}
+
+#[tokio::test]
+async fn test_simple_server_no_download() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
+    // The cache starts out empty.
+    let cache1 = TestCacheDir::prepare(&[]).unwrap();
+
+    // The server has a single, uncompressed, file.
+    let server1 =
+        TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).await;
+
+    let (symbol_cache, _) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+    );
+    let res = symbol_cache
+        .get_file_no_download("ShowSSEConfig.exe", "63E6C7F78000")
+        .await;
+    assert!(
+        matches!(res, Err(symsrv::Error::NotFound)),
+        "Should not have obtained the file from the server because it wasn't in the cache and we were using get_file_no_download"
+    );
+    assert!(
+        !cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The file should not be in the cache."
     );
 }
 
@@ -586,6 +645,10 @@ async fn test_server_with_cab_compression() {
 //  - Tests with multiple servers, falling back on 404 and other error responses
 //  - Tests for `NtSymbolPathEntry::Cache`: make sure things are propagated into that cache for
 //    files found in caches following that entry but not preceding it.
+//  - A test which checks that, if you have [(cache1, server1), (cache2, server2)], and cache1
+//    does not have the file but cache2 does, we get the file from server1 and not from cache2.
+//  - A test which does the same as the previous test, but with get_file_no_download, and gets
+//    the file from cache2.
 
 #[derive(Debug, Default)]
 struct TestObserverInner {
