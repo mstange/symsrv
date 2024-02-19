@@ -405,9 +405,9 @@ impl SymsrvDownloader {
         }
     }
 
-    /// This is the primary entry point to fetch symbols. Looks up the
+    /// This is the primary entry point to fetch files. Looks up the
     /// file according to the recipe in the symbol path, by searching
-    /// cache directories, downloading symbols from servers, and uncompressing files
+    /// cache directories, downloading files from servers, and uncompressing files
     /// as needed.
     ///
     /// If a matching file is found, a [`PathBuf`] to the uncompressed file on the local
