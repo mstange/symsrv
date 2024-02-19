@@ -5,7 +5,10 @@
 //!
 //! It exposes an async API and uses `reqwest` and `tokio::fs`.
 //!
-//! The downloaded symbols are stored and never evicted.
+//! The downloaded symbols are stored on the file system. No automatic expiration
+//! or eviction is performed. If you want to enforce a cache size limit or expire
+//! old files, you can observe cache file creations and accesses with the
+//! [`SymsrvObserver`] trait, and then manually delete files.
 //!
 //! ## Microsoft Documentation
 //!
@@ -26,10 +29,10 @@
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
 //! let default_downstream = get_default_downstream_store(); // "~/sym"
-//! let symbol_cache = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
+//! let downloader = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
 //!
 //! // Download and cache a PDB file.
-//! let local_path = symbol_cache.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
+//! let local_path = downloader.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
 //!
 //! // Use the PDB file.
 //! open_pdb_at_path(&local_path);
@@ -68,8 +71,9 @@ pub enum NtSymbolPathEntry {
     Chain {
         /// Usually `symsrv.dll`. (`srv*...` is shorthand for `symsrv*symsrv.dll*...`.)
         dll: String,
-        /// Any cache directories. The first directory is the "bottom-most" cache, and is always
-        // checked first, and always stores uncompressed files.
+        /// Any cache directories. The first directory is the "bottom-most" cache. The bottom cache
+        /// is always checked first, and always stores uncompressed files.
+        ///
         /// Any remaining directories are mid-level cache directories. These can store compressed files.
         cache_paths: Vec<CachePath>,
         /// Symbol server URLs. Can serve compressed or uncompressed files. Not used as a cache target.
@@ -366,7 +370,10 @@ pub trait SymsrvObserver: Send + Sync + 'static {
 
 static NEXT_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Obtains symbols according to the instructions in the symbol path.
+/// Obtains symbol files (PDBs + binary files) according to the instructions in the symbol path.
+///
+/// Create a new instance with [`SymsrvDownloader::new`], and then use the
+/// [`get_file`](SymsrvDownloader::get_file) method to obtain files.
 pub struct SymsrvDownloader {
     symbol_path: Vec<NtSymbolPathEntry>,
     default_downstream_store: Option<PathBuf>,
@@ -385,6 +392,28 @@ fn test_symsrv_downloader_error_is_send_and_sync() {
 
 impl SymsrvDownloader {
     /// Create a new `SymsrvDownloader`.
+    ///
+    /// `symbol_path` describes the behavior of the downloader, including which servers to
+    /// download from and which cache directories to use. The symbol path is commonly created
+    /// by parsing the `_NT_SYMBOL_PATH` environment variable with [`parse_nt_symbol_path`].
+    ///
+    /// `default_downstream_store` is the directory where files are stored if no other cache
+    /// directory is specified in a symbol path entry, for example if two asterisks are
+    /// used in a row in the `_NT_SYMBOL_PATH` environment variable, such as in `srv**URL`.
+    ///
+    /// `observer` is an optional observer which can be used for loggin, displaying progress
+    /// bars, informing automatic expiration of cached files, and so on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymsrvDownloader};
+    ///
+    /// let symbol_path = get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
+    /// let default_downstream = get_default_downstream_store(); // "~/sym"
+    /// let downloader = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
+    /// ```
     pub fn new(
         symbol_path: Vec<NtSymbolPathEntry>,
         default_downstream_store: Option<&Path>,
