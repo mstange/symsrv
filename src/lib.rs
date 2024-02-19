@@ -29,9 +29,7 @@
 //! let symbol_cache = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), None);
 //!
 //! // Download and cache a PDB file.
-//! let relative_path: PathBuf =
-//!     ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
-//! let local_path = symbol_cache.get_file(&relative_path).await?;
+//! let local_path = symbol_cache.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
 //!
 //! // Use the PDB file.
 //! open_pdb_at_path(&local_path);
@@ -407,27 +405,37 @@ impl SymsrvDownloader {
         }
     }
 
-    /// This is the primary entry point to fetch symbols. It takes a relative
-    /// `path` of the form `name.pdb\HEX\name.pdb`, and then looks up the
-    /// file according to the recipe of this `SymsrvDownloader`. That means it searches
-    /// cache directories, downloads symbols as needed, and uncompresses files
+    /// This is the primary entry point to fetch symbols. Looks up the
+    /// file according to the recipe in the symbol path, by searching
+    /// cache directories, downloading symbols from servers, and uncompressing files
     /// as needed.
     ///
-    /// If a matching file is found, a `PathBuf` to the uncompressed file on the local
+    /// If a matching file is found, a [`PathBuf`] to the uncompressed file on the local
     /// file system is returned.
     ///
-    /// The path should be a relative path to a symbol file. The file can be a PDB
-    /// file or a binary (exe / dll). The syntax of these paths is as follows:
+    /// The file name can be the name of a PDB file or of a binary file (i.e. .exe or .dll).
     ///
-    ///  - For PDBs: `<pdbName>\<GUID><age>\<pdbName>`, with `<GUID>` in uppercase
+    /// The syntax of the hash depends on the file type:
+    ///
+    ///  - For PDBs: The hash is `<GUID><age>`, with `<GUID>` in uppercase hex (no dashes)
     ///    and `<age>` in lowercase hex.
-    ///    Example: `xul.pdb\B2A2B092E45739B84C4C44205044422E1\xul.pdb`
-    ///  - For binaries: `<peName>\<TIMESTAMP><imageSize>\<peName>`, with `<TIMESTAMP>`
+    ///  - For binaries: The hash is `<TIMESTAMP><imageSize>`, with `<TIMESTAMP>`
     ///    printed as eight uppercase hex digits (with leading zeros added as needed)
-    ///    and `<imageSize>` in lowercase hex digits with as many digits as needed.
-    ///    Example: `renderdoc.dll\61015E74442b000\renderdoc.dll`
-    pub async fn get_file(&self, path: &Path) -> Result<PathBuf, Error> {
-        let rel_path_uncompressed = path;
+    ///    and `<imageSize>` in lowercase hex digits (no leading zeros).
+    ///
+    /// Examples:
+    ///
+    /// - `xul.pdb`, `B2A2B092E45739B84C4C44205044422E1`
+    /// - `renderdoc.dll`, `61015E74442b000`
+    ///
+    /// The PDB hash is commonly created with the help of the `debugid` crate,
+    /// using [`DebugId::breakpad()`](https://docs.rs/debugid/latest/debugid/struct.DebugId.html#method.breakpad).
+    ///
+    /// The binary hash (the "code ID") can be created using
+    /// [`wholesym::PeCodeId`](https://docs.rs/wholesym/latest/wholesym/struct.PeCodeId.html).
+    pub async fn get_file(&self, filename: &str, hash: &str) -> Result<PathBuf, Error> {
+        let path: PathBuf = [filename, hash, filename].iter().collect();
+        let rel_path_uncompressed = &path;
         let rel_path_compressed = create_compressed_path(rel_path_uncompressed)?;
 
         // This array will contain cache paths from `cache*` entries. These get added

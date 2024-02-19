@@ -180,9 +180,7 @@ async fn test_nothing_available() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "dummy.pdb/6E3C51F71CC1F0F64C4C44205044422E1/dummy.pdb",
-        ))
+        .get_file("dummy.pdb", "6E3C51F71CC1F0F64C4C44205044422E1")
         .await;
     assert!(
         matches!(res, Err(symsrv::Error::NotFound)),
@@ -225,9 +223,7 @@ async fn test_simple_available() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         res.is_ok(),
@@ -282,9 +278,7 @@ async fn test_simple_compressed() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         res.is_ok(),
@@ -358,9 +352,7 @@ async fn test_propagate_compressed() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         matches!(res, Ok(path) if file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")),
@@ -393,9 +385,7 @@ async fn test_simple_server() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         res.is_ok(),
@@ -431,9 +421,7 @@ async fn test_aborted_response() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         res.is_err(),
@@ -490,9 +478,7 @@ async fn test_dropped_future() {
     );
 
     {
-        let get_file_future = symbol_cache.get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ));
+        let get_file_future = symbol_cache.get_file("ShowSSEConfig.exe", "63E6C7F78000");
         pin!(get_file_future);
 
         let observer_copy = observer.clone();
@@ -543,9 +529,7 @@ async fn test_dont_use_server_if_cache_has_it() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         res.is_ok(),
@@ -574,9 +558,7 @@ async fn test_server_with_cab_compression() {
         Some(default_downstream.path()),
     );
     let res = symbol_cache
-        .get_file(Path::new(
-            "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe",
-        ))
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
         .await;
     assert!(
         res.is_ok(),

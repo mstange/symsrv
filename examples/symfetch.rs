@@ -104,8 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(observer),
     );
 
-    let path: PathBuf = [args.name.clone(), args.hash, args.name].iter().collect();
-    let path = symbol_cache.get_file(&path).await?;
+    let path = symbol_cache.get_file(&args.name, &args.hash).await?;
     println!("{}", path.to_string_lossy());
     Ok(())
 }
