@@ -9,7 +9,7 @@ pub enum CleanFileCreationError<E: std::error::Error + Send + Sync + 'static> {
     #[error("The destination path is invalid (no filename)")]
     InvalidPath,
 
-    #[error("The temporary file could not be created")]
+    #[error("The temporary file could not be created: {0}")]
     TempFileCreation(io::Error),
 
     #[error(
@@ -17,19 +17,21 @@ pub enum CleanFileCreationError<E: std::error::Error + Send + Sync + 'static> {
     )]
     TooManyLockRetries,
 
-    #[error("The temporary file could not be locked")]
+    #[error("The temporary file could not be locked: {0}")]
     TempFileLocking(io::Error),
 
-    #[error("The temporary file could not be truncated despite exclusive locked write access")]
+    #[error(
+        "The temporary file could not be truncated despite exclusive locked write access: {0}"
+    )]
     TempFileTruncation(io::Error),
 
     #[error("The temporary file is already being written to")]
     TempFileAlreadyBeingWrittenTo,
 
-    #[error("The callback function indicated an error")]
+    #[error("The callback function indicated an error: {0}")]
     CallbackIndicatedError(E),
 
-    #[error("The temporary file could not be renamed to the destination file")]
+    #[error("The temporary file could not be renamed to the destination file: {0}")]
     RenameError(io::Error),
 }
 
