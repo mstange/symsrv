@@ -1,8 +1,8 @@
 use clap::Parser;
 use indicatif::{DecimalBytes, MultiProgress, ProgressBar};
 use symsrv::{
-    get_default_downstream_store, parse_nt_symbol_path, CachePath, DownloadError,
-    NtSymbolPathEntry, SymsrvDownloader, SymsrvObserver,
+    get_home_sym_dir, parse_nt_symbol_path, CachePath, DownloadError, NtSymbolPathEntry,
+    SymsrvDownloader, SymsrvObserver,
 };
 
 use std::collections::HashMap;
@@ -96,15 +96,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let observer = Arc::new(SymFetchObserver::new());
 
-    let symbol_cache = SymsrvDownloader::new(
-        parsed_nt_symbol_path,
-        args.default_downstream_store
-            .or(get_default_downstream_store())
-            .as_deref(),
-        Some(observer),
-    );
+    let mut downloader = SymsrvDownloader::new(parsed_nt_symbol_path);
+    downloader.set_default_downstream_store(get_home_sym_dir());
+    downloader.set_observer(Some(observer));
 
-    let path = symbol_cache.get_file(&args.name, &args.hash).await?;
+    let path = downloader.get_file(&args.name, &args.hash).await?;
     println!("{}", path.to_string_lossy());
     Ok(())
 }

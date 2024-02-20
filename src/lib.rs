@@ -29,8 +29,8 @@
 //! let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
-//! let default_downstream = symsrv::get_default_downstream_store(); // "~/sym"
-//! let downloader = SymsrvDownloader::new(parsed_symbol_path, default_downstream.as_deref(), None);
+//! let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
+//! downloader.set_default_downstream_store(symsrv::get_home_sym_dir()); // "~/sym"
 //!
 //! // Download and cache a PDB file.
 //! let local_path = downloader.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
@@ -108,7 +108,7 @@ impl CachePath {
 }
 
 /// Currently returns ~/sym.
-pub fn get_default_downstream_store() -> Option<PathBuf> {
+pub fn get_home_sym_dir() -> Option<PathBuf> {
     // The Windows Debugger chooses the default downstream store as follows (see
     // <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>):
     // > If you include two asterisks in a row where a downstream store would normally be specified,
@@ -396,13 +396,6 @@ impl SymsrvDownloader {
     /// download from and which cache directories to use. The symbol path is commonly created
     /// by parsing the `_NT_SYMBOL_PATH` environment variable with [`parse_nt_symbol_path`].
     ///
-    /// `default_downstream_store` is the directory where files are stored if no other cache
-    /// directory is specified in a symbol path entry, for example if two asterisks are
-    /// used in a row in the `_NT_SYMBOL_PATH` environment variable, such as in `srv**URL`.
-    ///
-    /// `observer` is an optional observer which can be used for loggin, displaying progress
-    /// bars, informing automatic expiration of cached files, and so on.
-    ///
     /// # Example
     ///
     /// ```
@@ -413,14 +406,10 @@ impl SymsrvDownloader {
     /// let symbol_path = symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
     /// let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
     ///
-    /// let default_downstream = symsrv::get_default_downstream_store(); // "~/sym"
-    /// let downloader = SymsrvDownloader::new(parsed_symbol_path, default_downstream.as_deref(), None);
+    /// let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
+    /// downloader.set_default_downstream_store(symsrv::get_home_sym_dir()); // "~/sym"
     /// ```
-    pub fn new(
-        symbol_path: Vec<NtSymbolPathEntry>,
-        default_downstream_store: Option<&Path>,
-        observer: Option<Arc<dyn SymsrvObserver>>,
-    ) -> Self {
+    pub fn new(symbol_path: Vec<NtSymbolPathEntry>) -> Self {
         let builder = reqwest::Client::builder();
 
         // Turn off HTTP 2, in order to work around https://github.com/seanmonstar/reqwest/issues/1761 .
@@ -438,10 +427,30 @@ impl SymsrvDownloader {
 
         Self {
             symbol_path,
-            default_downstream_store: default_downstream_store.map(ToOwned::to_owned),
-            observer,
+            default_downstream_store: None,
+            observer: None,
             reqwest_client: client,
         }
+    }
+
+    /// Set the observer for this downloader.
+    ///
+    /// The observer can be used for logging, displaying progress bars, informing
+    /// automatic expiration of cached files, and so on.
+    ///
+    /// See the [`SymsrvObserver`] trait for more information.
+    pub fn set_observer(&mut self, observer: Option<Arc<dyn SymsrvObserver>>) {
+        self.observer = observer;
+    }
+
+    /// Set the default downstream store. This is the directory where files are stored if no other cache
+    /// directory is specified in a symbol path entry, for example if two asterisks are
+    /// used in a row in the `_NT_SYMBOL_PATH` environment variable, such as in `srv**URL`.
+    pub fn set_default_downstream_store<P: Into<PathBuf>>(
+        &mut self,
+        default_downstream_store: Option<P>,
+    ) {
+        self.default_downstream_store = default_downstream_store.map(Into::into);
     }
 
     /// This is the primary entry point to fetch files. Looks up the

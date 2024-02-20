@@ -32,12 +32,10 @@ fn make_symbol_cache(
     default_downstream_store: Option<&Path>,
 ) -> (SymsrvDownloader, Arc<TestObserver>) {
     let observer = Arc::new(TestObserver::default());
-    let cache = SymsrvDownloader::new(
-        symbol_path,
-        default_downstream_store,
-        Some(observer.clone()),
-    );
-    (cache, observer)
+    let mut downloader = SymsrvDownloader::new(symbol_path);
+    downloader.set_default_downstream_store(default_downstream_store);
+    downloader.set_observer(Some(observer.clone()));
+    (downloader, observer)
 }
 
 struct TestCacheDir {
