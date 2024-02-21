@@ -598,8 +598,7 @@ impl SymsrvDownloader {
                         ));
                     }
 
-                    // Prepare requests to all candidate URLs. We are not actually starting these requests
-                    // yet because we're not calling poll on the futures until we hit the await call in the loop below.
+                    // Prepare requests to all candidate URLs.
                     let response_futures: Vec<_> = file_urls
                         .into_iter()
                         .map(|(file_url, rel_path, is_compressed)| async move {
@@ -611,63 +610,71 @@ impl SymsrvDownloader {
                         })
                         .map(Box::pin)
                         .collect();
+                    // Start all requests and wait for the first successful response, then cancel
+                    // all other requests by dropping the array of futures.
+                    let Some((notifier, response, rel_path, is_compressed)) = async {
+                        let mut response_futures = PollAllPreservingOrder::new(response_futures);
+                        while let Some(next_response) = response_futures.next().await {
+                            let (prepared_response, rel_path, is_compressed) = next_response;
+                            if let Some((notifier, response)) = prepared_response {
+                                // This request returned a success status from the server.
+                                return Some((notifier, response, rel_path, is_compressed));
+                            };
+                        }
+                        None
+                    }
+                    .await
+                    else {
+                        // All requests failed.
+                        // We are done with this `NtSymbolPathEntry::Chain`. Go to the next entry.
+                        continue;
+                    };
 
-                    // Download the symbol file from the candidate URLs we've computed. If successful, also persist
-                    // the file to the previous cache paths.
-                    let mut response_futures = PollAllPreservingOrder::new(response_futures);
-                    while let Some(next_response) = response_futures.next().await {
-                        let (prepared_response, rel_path, is_compressed) = next_response;
-                        let Some((notifier, response)) = prepared_response else {
-                            // The request failed. Try the next URL.
-                            continue;
-                        };
+                    // If we get here, we have a response with a success HTTP status.
+                    // Download the file. If successful, also persist the file to the previous cache paths.
+                    let Some(dest_path) = self
+                        .download_file_to_cache(
+                            notifier,
+                            response,
+                            rel_path,
+                            download_dest_cache_dir,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
 
-                        // If we get here, the response headers indicated a success HTTP status.
-                        // Proceed to download the file.
-                        let Some(dest_path) = self
-                            .download_file_to_cache(
-                                notifier,
-                                response,
-                                rel_path,
-                                download_dest_cache_dir,
-                            )
-                            .await
-                        else {
-                            continue;
-                        };
-
-                        // We have a file!
-                        let uncompressed_dest_path = if is_compressed {
-                            if let Some((_remaining_bottom_cache, remaining_mid_level_caches)) =
-                                remaining_caches.split_first()
-                            {
-                                // Save the compressed file to the mid-level caches.
-                                self.copy_file_to_caches(
-                                    &rel_path_compressed,
-                                    &dest_path,
-                                    remaining_mid_level_caches,
-                                )
-                                .await;
-                            }
-                            // Extract the file into the bottom cache.
-                            self.extract_to_file_in_cache(
-                                &dest_path,
-                                rel_path_uncompressed,
-                                bottom_cache,
-                            )
-                            .await?
-                        } else {
-                            // The file is not compressed. Just copy to the other caches.
+                    // We have a file!
+                    let uncompressed_dest_path = if is_compressed {
+                        if let Some((_remaining_bottom_cache, remaining_mid_level_caches)) =
+                            remaining_caches.split_first()
+                        {
+                            // Save the compressed file to the mid-level caches.
                             self.copy_file_to_caches(
-                                rel_path_uncompressed,
+                                &rel_path_compressed,
                                 &dest_path,
-                                remaining_caches,
+                                remaining_mid_level_caches,
                             )
                             .await;
-                            dest_path
-                        };
-                        return Ok(uncompressed_dest_path);
-                    }
+                        }
+                        // Extract the file into the bottom cache.
+                        self.extract_to_file_in_cache(
+                            &dest_path,
+                            rel_path_uncompressed,
+                            bottom_cache,
+                        )
+                        .await?
+                    } else {
+                        // The file is not compressed. Just copy to the other caches.
+                        self.copy_file_to_caches(
+                            rel_path_uncompressed,
+                            &dest_path,
+                            remaining_caches,
+                        )
+                        .await;
+                        dest_path
+                    };
+                    return Ok(uncompressed_dest_path);
                 }
                 NtSymbolPathEntry::LocalOrShare(dir_path) => {
                     if persisted_cache_paths.contains(&CachePath::Path(dir_path.into())) {
