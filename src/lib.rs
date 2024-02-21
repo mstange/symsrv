@@ -107,18 +107,11 @@ impl CachePath {
     }
 }
 
-/// Currently returns ~/sym.
+/// Returns the absolute path to the `~/sym` directory. This is a reasonable default for the "default downstream store".
+/// The return value can be directly passed to [`SymsrvDownloader::set_default_downstream_store`].
+///
+/// This function returns `None` if the home directory cannot be determined.
 pub fn get_home_sym_dir() -> Option<PathBuf> {
-    // The Windows Debugger chooses the default downstream store as follows (see
-    // <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>):
-    // > If you include two asterisks in a row where a downstream store would normally be specified,
-    // > then the default downstream store is used. This store will be located in the sym subdirectory
-    // > of the home directory. The home directory defaults to the debugger installation directory;
-    // > this can be changed by using the !homedir extension or by setting the DBGHELP_HOMEDIR
-    // > environment variable.
-    //
-    // Let's ignore the part about the "debugger installation directory" and put the default
-    // store at ~/sym.
     let home_dir = dirs::home_dir()?;
     Some(home_dir.join("sym"))
 }
@@ -443,9 +436,21 @@ impl SymsrvDownloader {
         self.observer = observer;
     }
 
-    /// Set the default downstream store. This is the directory where files are stored if no other cache
-    /// directory is specified in a symbol path entry, for example if two asterisks are
-    /// used in a row in the `_NT_SYMBOL_PATH` environment variable, such as in `srv**URL`.
+    /// Set the default downstream store. In the `srv*DOWNSTREAM_STORE*URL` syntax for `_NT_SYMBOL_PATH`,
+    /// leaving the `DOWNSTREAM_STORE` part empty (i.e. having to asterisks in a row, as in `srv**URL`)
+    /// causes this default directory to be used.
+    ///
+    /// You can set this to `symsrv::get_home_sym_dir()` to use the `~/sym` directory.
+    ///
+    /// You can also leave this at the default `None` to disable the default downstream store;
+    /// this means that `srv**URL` entries will not work because the downloads have nowhere to go.
+    ///
+    /// The Windows Debugger [chooses the default downstream store as follows](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use):
+    /// > If you include two asterisks in a row where a downstream store would normally be specified,
+    /// > then the default downstream store is used. This store will be located in the sym subdirectory
+    /// > of the home directory. The home directory defaults to the debugger installation directory;
+    /// > this can be changed by using the [!homedir](https://learn.microsoft.com/en-us/windows-hardware/drivers/debuggercmds/-homedir)
+    /// > extension or by setting the `DBGHELP_HOMEDIR` environment variable.
     pub fn set_default_downstream_store<P: Into<PathBuf>>(
         &mut self,
         default_downstream_store: Option<P>,
@@ -453,13 +458,13 @@ impl SymsrvDownloader {
         self.default_downstream_store = default_downstream_store.map(Into::into);
     }
 
-    /// This is the primary entry point to fetch files. Looks up the
+    /// This is the primary entry point to fetch files. It looks up the
     /// file according to the recipe in the symbol path, by searching
     /// cache directories, downloading files from servers, and uncompressing files
     /// as needed.
     ///
-    /// If a matching file is found, a [`PathBuf`] to the uncompressed file on the local
-    /// file system is returned.
+    /// If a matching file is found, a [`PathBuf`] with the path to the uncompressed
+    /// file on the local file system is returned.
     ///
     /// The file name can be the name of a PDB file or of a binary file (i.e. .exe or .dll).
     ///
