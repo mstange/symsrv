@@ -30,7 +30,7 @@
 //!
 //! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
 //! let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
-//! downloader.set_default_downstream_store(symsrv::get_home_sym_dir()); // "~/sym"
+//! downloader.set_default_downstream_store(symsrv::get_home_sym_dir());
 //!
 //! // Download and cache a PDB file.
 //! let local_path = downloader.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
@@ -400,7 +400,7 @@ impl SymsrvDownloader {
     /// let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
     ///
     /// let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
-    /// downloader.set_default_downstream_store(symsrv::get_home_sym_dir()); // "~/sym"
+    /// downloader.set_default_downstream_store(symsrv::get_home_sym_dir());
     /// ```
     pub fn new(symbol_path: Vec<NtSymbolPathEntry>) -> Self {
         let builder = reqwest::Client::builder();
