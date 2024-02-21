@@ -3,12 +3,13 @@
 //! This crate lets you download and cache symbol files from symbol servers,
 //! according to the rules from the `_NT_SYMBOL_PATH` environment variable.
 //!
-//! It exposes an async API and uses `reqwest` and `tokio::fs`.
+//! It exposes an async API. Internally it uses `reqwest` and `tokio`.
 //!
 //! The downloaded symbols are stored on the file system. No automatic expiration
 //! or eviction is performed. If you want to enforce a cache size limit or expire
 //! old files, you can observe cache file creations and accesses with the
-//! [`SymsrvObserver`] trait, and then manually delete files.
+//! [`SymsrvObserver`] trait, and then write your own implementation for automatic
+//! file cleanup.
 //!
 //! ## Microsoft Documentation
 //!
