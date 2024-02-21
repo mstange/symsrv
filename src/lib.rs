@@ -496,7 +496,7 @@ impl SymsrvDownloader {
         self.get_file_impl(filename, hash, false).await
     }
 
-    pub async fn get_file_impl(
+    async fn get_file_impl(
         &self,
         filename: &str,
         hash: &str,
