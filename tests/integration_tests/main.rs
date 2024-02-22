@@ -136,7 +136,6 @@ impl TestSymbolServer {
             .with_chunked_body(move |w| {
                 for chunk in body.chunks(chunk_size) {
                     w.write_all(chunk).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Ok(())
             })
@@ -186,9 +185,9 @@ async fn test_nothing_available() {
     );
     let observer = observer.get_inner();
     assert_eq!(
-        observer.failed_downloads.len(),
+        observer.finished_downloads.len(),
         0,
-        "Should not have any failed downloads"
+        "Should not have any downloads"
     );
     assert_eq!(
         observer.missed_files.len(),
@@ -235,9 +234,9 @@ async fn test_simple_available() {
 
     let observer = observer.get_inner();
     assert_eq!(
-        observer.failed_downloads.len(),
+        observer.finished_downloads.len(),
         0,
-        "Should not have any failed downloads"
+        "Should not have any downloads"
     );
     assert_eq!(
         observer.missed_files.len(),
@@ -327,9 +326,9 @@ async fn test_simple_compressed() {
 
     let observer = observer.get_inner();
     assert_eq!(
-        observer.failed_downloads.len(),
+        observer.finished_downloads.len(),
         0,
-        "Should not have any failed downloads"
+        "Should not have any downloads"
     );
     assert_eq!(
         observer.missed_files.len(),
@@ -489,25 +488,38 @@ async fn test_aborted_response() {
         "The partial file should not be stored in the cache."
     );
 
-    let observer = observer.get_inner();
-    assert_eq!(
-        observer.failed_downloads.len(),
-        2,
-        "Should have two failed downloads"
-    );
     // The requests run in parallel, so we don't know which error will be reported first.
-    assert!(
-        observer.failed_downloads.iter().any(|(url, err)| url
-            == &(server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")
-            && matches!(err, DownloadError::ErrorDuringDownloading(_))),
-        "Should have failed to download the uncompressed file with the appropriate error"
-    );
-    assert!(
-        observer.failed_downloads.iter().any(|(url, err)| url
-            == &(server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_")
-            && matches!(err, DownloadError::StatusError(StatusCode::NOT_FOUND))),
-        "Should have failed to download the compressed file with the appropriate error"
-    );
+    let observer = observer.get_inner();
+    let download_outcomes_by_url: HashMap<String, &DownloadOutcome> = observer
+        .finished_downloads
+        .iter()
+        .map(|(url, outcome)| (url.clone(), outcome))
+        .collect();
+
+    let uncompressed_download_url =
+        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe";
+    let outcome_for_uncompressed_download = download_outcomes_by_url[&uncompressed_download_url];
+    if !matches!(
+        outcome_for_uncompressed_download,
+        DownloadOutcome::Failed(DownloadError::ErrorDuringDownloading(_))
+    ) {
+        panic!(
+            "Should have failed to download the uncompressed file with ErrorDuringDownloading, but got different error: {outcome_for_uncompressed_download:?}"
+        );
+    }
+
+    let compressed_download_url =
+        server1.url() + "/ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.ex_";
+    let outcome_for_compressed_download = download_outcomes_by_url[&compressed_download_url];
+    if !matches!(
+        outcome_for_compressed_download,
+        DownloadOutcome::Canceled
+            | DownloadOutcome::Failed(DownloadError::StatusError(StatusCode::NOT_FOUND))
+    ) {
+        panic!(
+            "Should have either canceled or 404'd the download of the compressed file, but got a different outcome: {outcome_for_compressed_download:?}"
+        );
+    }
 }
 
 // A test where the response from the server is partial and then the connection is aborted.
@@ -540,8 +552,14 @@ async fn test_dropped_future() {
 
         let observer_copy = observer.clone();
         poll_fn(move |cx: &mut Context<'_>| {
-            if observer_copy.get_inner().pending_downloads.is_empty() {
-                // Keep polling the future until a download has started.
+            let uncompressed_download_is_pending = observer_copy
+                .get_inner()
+                .pending_downloads
+                .values()
+                .any(|url| url.ends_with("/ShowSSEConfig.exe"));
+
+            if !uncompressed_download_is_pending {
+                // Keep polling the future until the download of the uncompressed file has started.
                 let result = get_file_future.as_mut().poll(cx);
                 result.map(|_| ())
             } else {
@@ -559,11 +577,24 @@ async fn test_dropped_future() {
     // and one for the uncompressed file, and we don't know which one will be current when the
     // future is dropped.
     let observer = observer.get_inner();
-    assert_ne!(
-        observer.canceled_downloads.len(),
-        0,
-        "Should at least one canceled download"
-    );
+    let Some(uncompressed_download_outcome) =
+        observer
+            .finished_downloads
+            .iter()
+            .find_map(|(url, outcome)| {
+                url.contains("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")
+                    .then_some(outcome)
+            })
+    else {
+        panic!(
+            "Should have a download outcome for the uncompressed file. Got: pending {:?}, finished {:?}",
+            observer.pending_downloads,
+            observer.finished_downloads
+        )
+    };
+    if !matches!(uncompressed_download_outcome, DownloadOutcome::Canceled) {
+        panic!("Should have canceled the download of the uncompressed file, but got: {uncompressed_download_outcome:?}");
+    }
 }
 
 #[tokio::test]
@@ -651,12 +682,17 @@ async fn test_server_with_cab_compression() {
 #[derive(Debug, Default)]
 struct TestObserverInner {
     pending_downloads: HashMap<u64, String>,
-    completed_downloads: Vec<String>,
-    failed_downloads: Vec<(String, DownloadError)>,
-    canceled_downloads: Vec<String>,
+    finished_downloads: Vec<(String, DownloadOutcome)>,
     missed_files: Vec<PathBuf>,
     created_files: Vec<(PathBuf, u64)>,
     accessed_files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+enum DownloadOutcome {
+    Completed,
+    Failed(DownloadError),
+    Canceled,
 }
 
 impl TestObserverInner {
@@ -666,12 +702,14 @@ impl TestObserverInner {
 
     fn on_download_failed(&mut self, download_id: u64, error: DownloadError) {
         let url = self.pending_downloads.remove(&download_id).unwrap();
-        self.failed_downloads.push((url, error));
+        self.finished_downloads
+            .push((url, DownloadOutcome::Failed(error)));
     }
 
     fn on_download_canceled(&mut self, download_id: u64) {
         let url = self.pending_downloads.remove(&download_id).unwrap();
-        self.canceled_downloads.push(url);
+        self.finished_downloads
+            .push((url, DownloadOutcome::Canceled));
     }
 
     fn on_download_completed(
@@ -682,7 +720,8 @@ impl TestObserverInner {
         _time_until_completed: std::time::Duration,
     ) {
         let url = self.pending_downloads.remove(&download_id).unwrap();
-        self.completed_downloads.push(url);
+        self.finished_downloads
+            .push((url, DownloadOutcome::Completed));
     }
 
     fn on_file_missed(&mut self, path: &Path) {
@@ -747,6 +786,24 @@ impl SymsrvObserver for TestObserver {
             time_until_completed,
         );
     }
+
+    fn on_new_cab_extraction(&self, _extraction_id: u64, _dest_path: &Path) {}
+    fn on_cab_extraction_progress(
+        &self,
+        _extraction_id: u64,
+        _bytes_so_far: u64,
+        _total_bytes: u64,
+    ) {
+    }
+    fn on_cab_extraction_completed(
+        &self,
+        _extraction_id: u64,
+        _total_uncompressed_size: u64,
+        _time_until_completed: std::time::Duration,
+    ) {
+    }
+    fn on_cab_extraction_failed(&self, _extraction_id: u64, _reason: symsrv::CabExtractionError) {}
+    fn on_cab_extraction_canceled(&self, _extraction_id: u64) {}
 
     fn on_file_missed(&self, path: &Path) {
         self.get_inner().on_file_missed(path);

@@ -1,8 +1,8 @@
 use clap::Parser;
 use indicatif::{DecimalBytes, MultiProgress, ProgressBar};
 use symsrv::{
-    get_home_sym_dir, parse_nt_symbol_path, CachePath, DownloadError, NtSymbolPathEntry,
-    SymsrvDownloader, SymsrvObserver,
+    get_home_sym_dir, parse_nt_symbol_path, CabExtractionError, CachePath, DownloadError,
+    NtSymbolPathEntry, SymsrvDownloader, SymsrvObserver,
 };
 
 use std::collections::HashMap;
@@ -155,6 +155,31 @@ impl SymsrvObserver for SymFetchObserver {
             .on_download_completed(download_id, uncompressed_size_in_bytes);
     }
 
+    fn on_new_cab_extraction(&self, extraction_id: u64, dest_path: &Path) {
+        self.get_inner()
+            .on_new_cab_extraction(extraction_id, dest_path);
+    }
+    fn on_cab_extraction_progress(&self, extraction_id: u64, bytes_so_far: u64, total_bytes: u64) {
+        self.get_inner()
+            .on_cab_extraction_progress(extraction_id, bytes_so_far, total_bytes);
+    }
+    fn on_cab_extraction_completed(
+        &self,
+        extraction_id: u64,
+        uncompressed_size_in_bytes: u64,
+        _time_until_completed: std::time::Duration,
+    ) {
+        self.get_inner()
+            .on_cab_extraction_completed(extraction_id, uncompressed_size_in_bytes);
+    }
+    fn on_cab_extraction_failed(&self, extraction_id: u64, reason: CabExtractionError) {
+        self.get_inner()
+            .on_cab_extraction_failed(extraction_id, reason);
+    }
+    fn on_cab_extraction_canceled(&self, extraction_id: u64) {
+        self.get_inner().on_cab_extraction_canceled(extraction_id);
+    }
+
     fn on_file_missed(&self, _path: &Path) {}
 
     fn on_file_created(&self, _path: &Path, _size_in_bytes: u64) {}
@@ -165,6 +190,7 @@ impl SymsrvObserver for SymFetchObserver {
 struct SymFetchObserverInner {
     multi_progress: MultiProgress,
     requests: HashMap<u64, RequestData>,
+    extractions: HashMap<u64, ExtractionData>,
 }
 
 impl SymFetchObserverInner {
@@ -172,6 +198,7 @@ impl SymFetchObserverInner {
         Self {
             multi_progress: MultiProgress::new(),
             requests: HashMap::new(),
+            extractions: HashMap::new(),
         }
     }
 
@@ -266,11 +293,96 @@ impl SymFetchObserverInner {
             ))
             .unwrap();
     }
+
+    fn on_new_cab_extraction(&mut self, extraction_id: u64, dest_path: &Path) {
+        let progress_bar = self.multi_progress.add(ProgressBar::new_spinner());
+        progress_bar.set_style(style::spinner());
+        progress_bar.set_message(format!(
+            "Extracting to {dest_path}...",
+            dest_path = dest_path.to_string_lossy()
+        ));
+        self.extractions.insert(
+            extraction_id,
+            ExtractionData {
+                progress_bar,
+                extracted_path: dest_path.to_owned(),
+                is_determinate: false,
+            },
+        );
+    }
+
+    fn on_cab_extraction_progress(
+        &mut self,
+        extraction_id: u64,
+        bytes_so_far: u64,
+        total_bytes: u64,
+    ) {
+        let extraction = self.extractions.get_mut(&extraction_id).unwrap();
+        if !extraction.is_determinate {
+            let progress_bar = self.multi_progress.insert_after(
+                &extraction.progress_bar,
+                ProgressBar::new(total_bytes).with_elapsed(extraction.progress_bar.elapsed()),
+            );
+            self.multi_progress.remove(&extraction.progress_bar);
+            progress_bar.set_style(style::bar());
+            progress_bar.set_message(format!(
+                "Extracting {path}...",
+                path = extraction.extracted_path.to_string_lossy()
+            ));
+            extraction.progress_bar = progress_bar;
+            extraction.is_determinate = true;
+        }
+        extraction.progress_bar.set_position(bytes_so_far);
+    }
+
+    fn on_cab_extraction_completed(&mut self, extraction_id: u64, uncompressed_size_in_bytes: u64) {
+        let extraction = self.extractions.remove(&extraction_id).unwrap();
+        extraction.progress_bar.finish();
+        self.multi_progress.remove(&extraction.progress_bar);
+        self.multi_progress
+            .println(format!(
+                "Successfully extracted {} to {path}.",
+                DecimalBytes(uncompressed_size_in_bytes),
+                path = extraction.extracted_path.to_string_lossy()
+            ))
+            .unwrap();
+    }
+
+    fn on_cab_extraction_failed(&mut self, extraction_id: u64, reason: CabExtractionError) {
+        let extraction = self.extractions.remove(&extraction_id).unwrap();
+        extraction.progress_bar.finish_and_clear();
+        self.multi_progress.remove(&extraction.progress_bar);
+        self.multi_progress
+            .println(format!(
+                "Failed to extract {path}: {reason}.",
+                path = extraction.extracted_path.to_string_lossy(),
+                reason = reason
+            ))
+            .unwrap();
+    }
+
+    fn on_cab_extraction_canceled(&mut self, extraction_id: u64) {
+        let extraction = self.extractions.remove(&extraction_id).unwrap();
+        extraction.progress_bar.finish_and_clear();
+        self.multi_progress.remove(&extraction.progress_bar);
+        self.multi_progress
+            .println(format!(
+                "Canceled extraction of {path}.",
+                path = extraction.extracted_path.to_string_lossy()
+            ))
+            .unwrap();
+    }
 }
 
 struct RequestData {
     progress_bar: ProgressBar,
     url: String,
+    is_determinate: bool,
+}
+
+struct ExtractionData {
+    progress_bar: ProgressBar,
+    extracted_path: PathBuf,
     is_determinate: bool,
 }
 

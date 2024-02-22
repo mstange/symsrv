@@ -46,7 +46,7 @@ mod download;
 mod file_creation;
 mod poll_all;
 
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -197,6 +197,10 @@ pub enum Error {
     /// Unexpected Content-Encoding header.
     #[error("Unexpected Content-Encoding header: {0}")]
     UnexpectedContentEncoding(String),
+
+    /// An error occurred while extracting a CAB archive.
+    #[error("Error while extracting a CAB archive: {0}")]
+    CabExtraction(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -248,6 +252,38 @@ pub enum DownloadError {
     /// Error while writing the downloaded file.
     #[error("Error while writing the downloaded file: {0}")]
     ErrorWhileWritingDownloadedFile(std::io::Error),
+
+    /// Redirect-related error.
+    #[error("Redirect-related error")]
+    Redirect(Box<dyn std::error::Error + Send + Sync>),
+
+    /// Other error.
+    #[error("Other error: {0}")]
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// The error type used in the observer notification [`SymsrvObserver::on_cab_extraction_failed`].
+#[derive(thiserror::Error, Debug)]
+pub enum CabExtractionError {
+    /// The CAB archive did not contain any files.
+    #[error("Empty CAB archive")]
+    EmptyCab,
+
+    /// The CAB archive could not be opened.
+    #[error("Could not open CAB file: {0}")]
+    CouldNotOpenCabFile(std::io::Error),
+
+    /// The CAB archive could not be parsed.
+    #[error("Error while parsing the CAB file: {0}")]
+    CabParsing(std::io::Error),
+
+    /// There was an error while reading the CAB archive.
+    #[error("Error while reading the CAB file: {0}")]
+    CabReading(std::io::Error),
+
+    /// There was an error while writing the extracted file.
+    #[error("Error while writing the file: {0}")]
+    FileWriting(std::io::Error),
 
     /// Redirect-related error.
     #[error("Redirect-related error")]
@@ -341,6 +377,17 @@ pub trait SymsrvObserver: Send + Sync + 'static {
     /// given download ID.
     fn on_download_canceled(&self, download_id: u64);
 
+    fn on_new_cab_extraction(&self, extraction_id: u64, dest_path: &Path);
+    fn on_cab_extraction_progress(&self, extraction_id: u64, bytes_so_far: u64, total_bytes: u64);
+    fn on_cab_extraction_completed(
+        &self,
+        extraction_id: u64,
+        uncompressed_size_in_bytes: u64,
+        time_until_completed: Duration,
+    );
+    fn on_cab_extraction_failed(&self, extraction_id: u64, reason: CabExtractionError);
+    fn on_cab_extraction_canceled(&self, extraction_id: u64);
+
     /// Called when a file has been created, for example because it was downloaded from
     /// a server, copied from a different cache directory, or extracted from a compressed
     /// file.
@@ -361,7 +408,7 @@ pub trait SymsrvObserver: Send + Sync + 'static {
     fn on_file_missed(&self, path: &Path);
 }
 
-static NEXT_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_DOWNLOAD_OR_EXTRACTION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Obtains symbol files (PDBs + binary files) according to the instructions in the symbol path.
 ///
@@ -830,29 +877,51 @@ impl SymsrvDownloader {
             .await?;
         let compressed_input_path = compressed_input_path.to_owned();
 
-        let extracted_size = create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
-            {
-                let mut dest_file = dest_file.into_std().await;
-                tokio::task::spawn_blocking(move || -> std::result::Result<u64, Error> {
-                    let file = std::fs::File::open(&compressed_input_path)?;
-                    let buf_read = BufReader::new(file);
-
-                    let mut cabinet = cab::Cabinet::new(buf_read)?;
-                    let file_name_in_cab = {
-                        // Only pick the first file we encounter. That's the PDB.
-                        let folder = cabinet.folder_entries().next().unwrap();
-                        let file = folder.file_entries().next().unwrap();
-                        file.name().to_string()
-                    };
-                    let mut reader = cabinet.read_file(&file_name_in_cab)?;
-                    let bytes_written = std::io::copy(&mut reader, &mut dest_file)?;
-                    Ok(bytes_written)
-                })
-                .await
-                .expect("task panicked")
+        let notifier = {
+            let observer = self.observer.clone();
+            let extraction_id =
+                NEXT_DOWNLOAD_OR_EXTRACTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(observer) = observer.as_deref() {
+                observer.on_new_cab_extraction(extraction_id, &dest_path);
             }
-        })
-        .await?;
+            ExtractionStatusReporter::new(extraction_id, observer)
+        };
+        let extraction_id = notifier.extraction_id();
+
+        let observer = self.observer.clone();
+        let extracted_size_result =
+            create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
+                {
+                    let mut dest_file = dest_file.into_std().await;
+                    tokio::task::spawn_blocking(move || {
+                        let file = std::fs::File::open(compressed_input_path)
+                            .map_err(CabExtractionError::CouldNotOpenCabFile)?;
+                        let buf_read = BufReader::new(file);
+                        extract_cab_to_file(extraction_id, buf_read, &mut dest_file, observer)
+                    })
+                    .await
+                    .expect("task panicked")
+                }
+            })
+            .await;
+
+        let extracted_size = match extracted_size_result {
+            Ok(size) => size,
+            Err(e) => {
+                let error = Error::CabExtraction(format!("{}", e));
+                match e {
+                    CleanFileCreationError::CallbackIndicatedError(e) => {
+                        notifier.extraction_failed(e);
+                    }
+                    _ => {
+                        notifier.extraction_failed(CabExtractionError::FileWriting(e.into()));
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        notifier.extraction_completed(extracted_size, Instant::now());
 
         if let Some(observer) = self.observer.as_deref() {
             observer.on_file_created(&dest_path, extracted_size);
@@ -864,7 +933,8 @@ impl SymsrvDownloader {
         &self,
         url: &str,
     ) -> Option<(DownloadStatusReporter, reqwest::Response)> {
-        let download_id = NEXT_DOWNLOAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let download_id =
+            NEXT_DOWNLOAD_OR_EXTRACTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(observer) = self.observer.as_deref() {
             observer.on_new_download_before_connect(download_id, url);
         }
@@ -982,6 +1052,47 @@ impl SymsrvDownloader {
     }
 }
 
+fn get_first_file_entry<R: Read + Seek>(cabinet: &mut cab::Cabinet<R>) -> Option<(String, u64)> {
+    for folder in cabinet.folder_entries() {
+        if let Some(file) = folder.file_entries().next() {
+            return Some((file.name().to_owned(), file.uncompressed_size().into()));
+        }
+    }
+    None
+}
+
+fn extract_cab_to_file<R: Read + Seek>(
+    extraction_id: u64,
+    source_data: R,
+    dest_file: &mut std::fs::File,
+    observer: Option<Arc<dyn SymsrvObserver>>,
+) -> Result<u64, CabExtractionError> {
+    use CabExtractionError::*;
+    let mut cabinet = cab::Cabinet::new(source_data).map_err(CabParsing)?;
+    let (file_entry_name, file_extracted_size) =
+        get_first_file_entry(&mut cabinet).ok_or(EmptyCab)?;
+    let mut reader = cabinet.read_file(&file_entry_name).map_err(CabParsing)?;
+
+    let mut bytes_written = 0;
+    loop {
+        let mut buf = [0; 4096];
+        let bytes_read = reader.read(&mut buf).map_err(CabReading)?;
+        if bytes_read == 0 {
+            break;
+        }
+        dest_file
+            .write_all(&buf[..bytes_read])
+            .map_err(FileWriting)?;
+        bytes_written += bytes_read as u64;
+
+        if let Some(observer) = observer.as_deref() {
+            observer.on_cab_extraction_progress(extraction_id, bytes_written, file_extracted_size);
+        }
+    }
+
+    Ok(bytes_written)
+}
+
 /// Convert a relative `Path` into a URL by appending the components to the
 /// given base URL.
 fn url_join(base_url: &str, components: std::path::Components) -> String {
@@ -1073,6 +1184,71 @@ impl Drop for DownloadStatusReporter {
             // This was most likely because the future we were stored in was dropped.
             // Tell the observer.
             observer.on_download_canceled(download_id);
+        }
+    }
+}
+
+/// A helper struct with a drop handler. This lets us detect when a extraction
+/// is cancelled by dropping the future.
+struct ExtractionStatusReporter {
+    /// Set to `None` when `extraction_failed()` or `extraction_completed()` is called.
+    extraction_id: Option<u64>,
+    observer: Option<Arc<dyn SymsrvObserver>>,
+    ts_before_start: Instant,
+}
+
+impl ExtractionStatusReporter {
+    pub fn new(extraction_id: u64, observer: Option<Arc<dyn SymsrvObserver>>) -> Self {
+        Self {
+            extraction_id: Some(extraction_id),
+            observer,
+            ts_before_start: Instant::now(),
+        }
+    }
+
+    pub fn extraction_id(&self) -> u64 {
+        self.extraction_id.unwrap()
+    }
+
+    pub fn extraction_failed(mut self, e: CabExtractionError) {
+        if let (Some(extraction_id), Some(observer)) =
+            (self.extraction_id, self.observer.as_deref())
+        {
+            observer.on_cab_extraction_failed(extraction_id, e);
+        }
+        self.extraction_id = None;
+        // Drop self. Now the Drop handler won't do anything.
+    }
+
+    pub fn extraction_completed(
+        mut self,
+        uncompressed_size_in_bytes: u64,
+        ts_after_completed: Instant,
+    ) {
+        if let (Some(extraction_id), Some(observer)) =
+            (self.extraction_id, self.observer.as_deref())
+        {
+            let time_until_completed = ts_after_completed.duration_since(self.ts_before_start);
+            observer.on_cab_extraction_completed(
+                extraction_id,
+                uncompressed_size_in_bytes,
+                time_until_completed,
+            );
+        }
+        self.extraction_id = None;
+        // Drop self. Now the Drop handler won't do anything.
+    }
+}
+
+impl Drop for ExtractionStatusReporter {
+    fn drop(&mut self) {
+        if let (Some(extraction_id), Some(observer)) =
+            (self.extraction_id, self.observer.as_deref())
+        {
+            // We were dropped before a call to `extraction_failed` or `extraction_completed`.
+            // This was most likely because the future we were stored in was dropped.
+            // Tell the observer.
+            observer.on_cab_extraction_canceled(extraction_id);
         }
     }
 }
