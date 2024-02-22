@@ -162,7 +162,7 @@ pub fn parse_nt_symbol_path(symbol_path: &str) -> Vec<NtSymbolPathEntry> {
         .collect()
 }
 
-/// The error type used in this crate.
+/// The error type used for results returned from [`SymsrvDownloader::get_file`].
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
