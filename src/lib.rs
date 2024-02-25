@@ -232,8 +232,8 @@ pub enum DownloadError {
     ClientCreationFailed(String),
 
     /// Opening the request failed.
-    #[error("Opening the request failed")]
-    OpenFailed,
+    #[error("Opening the request failed: {0}")]
+    OpenFailed(Box<dyn std::error::Error + Send + Sync>),
 
     /// The download timed out.
     #[error("The download timed out")]
@@ -312,7 +312,7 @@ impl From<reqwest::Error> for DownloadError {
         if e.is_status() {
             DownloadError::StatusError(e.status().unwrap())
         } else if e.is_request() {
-            DownloadError::OpenFailed
+            DownloadError::OpenFailed(e.into())
         } else if e.is_redirect() {
             DownloadError::Redirect(e.into())
         } else if e.is_timeout() {
