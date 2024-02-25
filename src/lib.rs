@@ -42,26 +42,30 @@
 //! # }
 //! ```
 
+mod computation_coalescing;
 mod download;
 mod file_creation;
 mod poll_all;
 mod remotely_fed_cursor;
 
+use std::future::Future;
 use std::io::{BufReader, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use file_creation::{create_file_cleanly, CleanFileCreationError};
 use futures_util::{future, AsyncReadExt};
-use poll_all::PollAllPreservingOrder;
-use remotely_fed_cursor::{RemotelyFedCursor, RemotelyFedCursorFeeder};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
-use crate::download::response_to_uncompressed_stream_with_progress;
+use computation_coalescing::ComputationCoalescer;
+use download::response_to_uncompressed_stream_with_progress;
+use file_creation::{create_file_cleanly, CleanFileCreationError};
+use poll_all::PollAllPreservingOrder;
+use remotely_fed_cursor::{RemotelyFedCursor, RemotelyFedCursorFeeder};
 
 /// The parsed representation of one entry in the (semicolon-separated list of entries in the) `_NT_SYMBOL_PATH` environment variable.
 /// The syntax of this string is documented at <https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/advanced-symsrv-use>.
@@ -165,12 +169,12 @@ pub fn parse_nt_symbol_path(symbol_path: &str) -> Vec<NtSymbolPathEntry> {
 }
 
 /// The error type used for results returned from [`SymsrvDownloader::get_file`].
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum Error {
     /// There was an error when interacting with the file system.
     #[error("IO error: {0}")]
-    IoError(#[source] std::io::Error),
+    IoError(String),
 
     /// The requested file was not found.
     #[error("The file was not found in the SymsrvDownloader.")]
@@ -190,11 +194,11 @@ pub enum Error {
 
     /// An internal error occurred: Couldn't join task
     #[error("An internal error occurred: Couldn't join task")]
-    JoinError(#[from] tokio::task::JoinError),
+    JoinError(String),
 
     /// Generic error from `reqwest`.
     #[error("ReqwestError: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    ReqwestError(String),
 
     /// Unexpected Content-Encoding header.
     #[error("Unexpected Content-Encoding header: {0}")]
@@ -207,7 +211,7 @@ pub enum Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Error {
-        Error::IoError(err)
+        Error::IoError(err.to_string())
     }
 }
 
@@ -215,7 +219,7 @@ impl From<CleanFileCreationError<Error>> for Error {
     fn from(e: CleanFileCreationError<Error>) -> Error {
         match e {
             CleanFileCreationError::CallbackIndicatedError(e) => e,
-            e => Error::IoError(e.into()),
+            e => Error::IoError(e.to_string()),
         }
     }
 }
@@ -417,6 +421,14 @@ static NEXT_DOWNLOAD_OR_EXTRACTION_ID: AtomicU64 = AtomicU64::new(0);
 /// Create a new instance with [`SymsrvDownloader::new`], and then use the
 /// [`get_file`](SymsrvDownloader::get_file) method to obtain files.
 pub struct SymsrvDownloader {
+    inner: Arc<SymsrvDownloaderInner>,
+    inflight_request_cache:
+        ComputationCoalescer<(String, String, bool), PinBoxDynFuture<Result<PathBuf, Error>>>,
+}
+
+type PinBoxDynFuture<T> = Pin<Box<dyn Future<Output = T> + Send + Sync>>;
+
+struct SymsrvDownloaderInner {
     symbol_path: Vec<NtSymbolPathEntry>,
     default_downstream_store: Option<PathBuf>,
     observer: Option<Arc<dyn SymsrvObserver>>,
@@ -453,26 +465,9 @@ impl SymsrvDownloader {
     /// downloader.set_default_downstream_store(symsrv::get_home_sym_dir());
     /// ```
     pub fn new(symbol_path: Vec<NtSymbolPathEntry>) -> Self {
-        let builder = reqwest::Client::builder();
-
-        // Turn off HTTP 2, in order to work around https://github.com/seanmonstar/reqwest/issues/1761 .
-        let builder = builder.http1_only();
-
-        // Turn off automatic decompression because it doesn't allow us to compute
-        // download progress percentages: we'd only know the decompressed current
-        // size and the compressed total size.
-        // Instead, we do the streaming decompression manually, see download.rs.
-        let builder = builder.no_gzip().no_brotli().no_deflate();
-
-        // Create the client.
-        // TODO: Add timeouts, user agent, maybe other settings
-        let client = builder.build();
-
         Self {
-            symbol_path,
-            default_downstream_store: None,
-            observer: None,
-            reqwest_client: client,
+            inner: Arc::new(SymsrvDownloaderInner::new(symbol_path)),
+            inflight_request_cache: ComputationCoalescer::new(),
         }
     }
 
@@ -483,7 +478,7 @@ impl SymsrvDownloader {
     ///
     /// See the [`SymsrvObserver`] trait for more information.
     pub fn set_observer(&mut self, observer: Option<Arc<dyn SymsrvObserver>>) {
-        self.observer = observer;
+        Arc::get_mut(&mut self.inner).unwrap().observer = observer;
     }
 
     /// Set the default downstream store. In the `srv*DOWNSTREAM_STORE*URL` syntax for `_NT_SYMBOL_PATH`,
@@ -505,7 +500,9 @@ impl SymsrvDownloader {
         &mut self,
         default_downstream_store: Option<P>,
     ) {
-        self.default_downstream_store = default_downstream_store.map(Into::into);
+        Arc::get_mut(&mut self.inner)
+            .unwrap()
+            .default_downstream_store = default_downstream_store.map(Into::into);
     }
 
     /// This is the primary entry point to fetch files. It looks up the
@@ -547,6 +544,54 @@ impl SymsrvDownloader {
     }
 
     async fn get_file_impl(
+        &self,
+        filename: &str,
+        hash: &str,
+        allow_downloads: bool,
+    ) -> Result<PathBuf, Error> {
+        let inner = self.inner.clone();
+        let filename = filename.to_owned();
+        let hash = hash.to_owned();
+
+        self.inflight_request_cache
+            .subscribe_or_compute(
+                &(filename.clone(), hash.clone(), allow_downloads),
+                move || {
+                    let f =
+                        async move { inner.get_file_impl(&filename, &hash, allow_downloads).await };
+                    Box::pin(f)
+                },
+            )
+            .await
+    }
+}
+
+impl SymsrvDownloaderInner {
+    pub fn new(symbol_path: Vec<NtSymbolPathEntry>) -> Self {
+        let builder = reqwest::Client::builder();
+
+        // Turn off HTTP 2, in order to work around https://github.com/seanmonstar/reqwest/issues/1761 .
+        let builder = builder.http1_only();
+
+        // Turn off automatic decompression because it doesn't allow us to compute
+        // download progress percentages: we'd only know the decompressed current
+        // size and the compressed total size.
+        // Instead, we do the streaming decompression manually, see download.rs.
+        let builder = builder.no_gzip().no_brotli().no_deflate();
+
+        // Create the client.
+        // TODO: Add timeouts, user agent, maybe other settings
+        let client = builder.build();
+
+        Self {
+            symbol_path,
+            default_downstream_store: None,
+            observer: None,
+            reqwest_client: client,
+        }
+    }
+
+    pub async fn get_file_impl(
         &self,
         filename: &str,
         hash: &str,

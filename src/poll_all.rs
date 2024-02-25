@@ -1,4 +1,4 @@
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::task::Poll;
 
 use futures_util::FutureExt;
@@ -6,13 +6,13 @@ use futures_util::FutureExt;
 /// Provides a way to iterate over a collection of futures, but polling all
 /// of them from the start. This can be used to start e.g. network requests
 /// in parallel and to consume the results in the original order.
-pub struct PollAllPreservingOrder<V, F: futures::Future<Output = V> + Unpin> {
+pub struct PollAllPreservingOrder<V, F: Future<Output = V> + Unpin> {
     values: Vec<Option<V>>, // None if pending or already consumed, Some if ready
     pending_futures: Vec<(usize, F)>,
     current_index: usize,
 }
 
-impl<V, F: futures::Future<Output = V> + Unpin> PollAllPreservingOrder<V, F> {
+impl<V, F: Future<Output = V> + Unpin> PollAllPreservingOrder<V, F> {
     pub fn new(futures: Vec<F>) -> Self {
         Self {
             values: futures.iter().map(|_| None).collect(),
@@ -51,7 +51,7 @@ impl<V, F: futures::Future<Output = V> + Unpin> PollAllPreservingOrder<V, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::ready;
+    use futures_util::future::ready;
 
     #[tokio::test]
     async fn test_poll_all_ready() {

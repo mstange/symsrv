@@ -1,7 +1,7 @@
 use async_compression::futures::bufread::GzipDecoder;
-use futures::{io::BufReader, AsyncRead, TryStreamExt};
+use futures_util::{io::BufReader, AsyncRead, TryStreamExt};
 use reqwest::header::{AsHeaderName, HeaderMap, CONTENT_ENCODING, CONTENT_LENGTH};
-use std::{cell::RefCell, pin::Pin, task::Poll};
+use std::{pin::Pin, sync::Mutex, task::Poll};
 
 fn get_header<K: AsHeaderName>(headers: &HeaderMap, name: K) -> Option<String> {
     Some(headers.get(name)?.to_str().ok()?.to_ascii_lowercase())
@@ -63,9 +63,9 @@ pub enum Error {
 pub fn response_to_uncompressed_stream_with_progress<F>(
     response: reqwest::Response,
     progress: F,
-) -> Result<Pin<Box<dyn AsyncRead>>, Error>
+) -> Result<Pin<Box<dyn AsyncRead + Send + Sync>>, Error>
 where
-    F: FnMut(u64, Option<u64>) + 'static,
+    F: FnMut(u64, Option<u64>) + Send + Sync + 'static,
 {
     let headers = response.headers();
     let response_encoding = get_header(headers, CONTENT_ENCODING);
@@ -116,11 +116,11 @@ struct ProgressNotifierData<F: FnMut(u64, Option<u64>)> {
     accumulated_size: u64,
 }
 
-struct ProgressNotifier<F: FnMut(u64, Option<u64>)>(RefCell<ProgressNotifierData<F>>);
+struct ProgressNotifier<F: FnMut(u64, Option<u64>)>(Mutex<ProgressNotifierData<F>>);
 
 impl<F: FnMut(u64, Option<u64>)> AsyncReadObserver for ProgressNotifier<F> {
     fn did_read(&self, len: u64) {
-        let mut data = self.0.borrow_mut();
+        let mut data = self.0.lock().unwrap();
         data.accumulated_size += len;
         let accum = data.accumulated_size;
         let total_size = data.total_size;
@@ -133,7 +133,7 @@ impl<F: FnMut(u64, Option<u64>)> AsyncReadObserver for ProgressNotifier<F> {
 
 impl<F: FnMut(u64, Option<u64>)> ProgressNotifier<F> {
     pub fn new(progress_fun: F, total_size: Option<u64>) -> Self {
-        Self(RefCell::new(ProgressNotifierData {
+        Self(Mutex::new(ProgressNotifierData {
             progress_fun,
             total_size,
             accumulated_size: 0,
@@ -143,11 +143,11 @@ impl<F: FnMut(u64, Option<u64>)> ProgressNotifier<F> {
 
 struct AsyncReadWrapper<I: AsyncRead> {
     inner: Pin<Box<I>>,
-    observer: Pin<Box<dyn AsyncReadObserver>>,
+    observer: Pin<Box<dyn AsyncReadObserver + Send + Sync>>,
 }
 
 impl<I: AsyncRead> AsyncReadWrapper<I> {
-    pub fn new<O: AsyncReadObserver + 'static>(inner: I, observer: O) -> Self {
+    pub fn new<O: AsyncReadObserver + Send + Sync + 'static>(inner: I, observer: O) -> Self {
         Self {
             inner: Box::pin(inner),
             observer: Box::pin(observer),
@@ -174,7 +174,7 @@ impl<I: AsyncRead> AsyncRead for AsyncReadWrapper<I> {
 }
 
 trait WithProgress: AsyncRead + Sized {
-    fn with_progress<F: FnMut(u64, Option<u64>) + 'static>(
+    fn with_progress<F: FnMut(u64, Option<u64>) + Send + Sync + 'static>(
         self,
         progress_fun: F,
         total_size: Option<u64>,
@@ -182,7 +182,7 @@ trait WithProgress: AsyncRead + Sized {
 }
 
 impl<AR: AsyncRead + Sized> WithProgress for AR {
-    fn with_progress<F: FnMut(u64, Option<u64>) + 'static>(
+    fn with_progress<F: FnMut(u64, Option<u64>) + Send + Sync + 'static>(
         self,
         progress_fun: F,
         total_size: Option<u64>,
