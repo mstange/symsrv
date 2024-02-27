@@ -18,7 +18,6 @@
 //! ## Example
 //!
 //! ```
-//! use std::path::PathBuf;
 //! use symsrv::SymsrvDownloader;
 //!
 //! # fn open_pdb_at_path(p: &std::path::Path) {}
@@ -29,7 +28,7 @@
 //! let symbol_path = symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
 //! let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
 //!
-//! // Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
+//! // Create a downloader which follows the _NT_SYMBOL_PATH recipe.
 //! let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
 //! downloader.set_default_downstream_store(symsrv::get_home_sym_dir());
 //!

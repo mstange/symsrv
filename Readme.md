@@ -3,11 +3,16 @@
 
 # symsrv
 
-This crate lets you download and cache pdb files from symbol servers, according to the rules from the `_NT_SYMBOL_PATH` environment variable.
+This crate lets you download and cache symbol files from symbol servers,
+according to the rules from the `_NT_SYMBOL_PATH` environment variable.
 
-It exposes an async API and uses `reqwest` and `tokio::fs`.
+It exposes an async API. Internally it uses `reqwest` and `tokio`.
 
-The downloaded symbols are stored and never evicted.
+The downloaded symbols are stored on the file system. No automatic expiration
+or eviction is performed. If you want to enforce a cache size limit or expire
+old files, you can observe cache file creations and accesses with the
+[`SymsrvObserver`] trait, and then write your own implementation for automatic
+file cleanup.
 
 ## Microsoft Documentation
 
@@ -16,25 +21,35 @@ The downloaded symbols are stored and never evicted.
 ## Example
 
 ```rust
-use std::path::PathBuf;
-use symsrv::{get_default_downstream_store, get_symbol_path_from_environment, SymsrvDownloader};
+use symsrv::{SymsrvDownloader};
 
 // Parse the _NT_SYMBOL_PATH environment variable.
+let symbol_path_env = symsrv::get_symbol_path_from_environment();
 let symbol_path =
-    get_symbol_path_from_environment("srv**https://msdl.microsoft.com/download/symbols");
+  symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
+let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
 
-// Create a symbol cache which follows the _NT_SYMBOL_PATH recipe.
-let default_downstream = get_default_downstream_store(); // "~/sym"
-let symbol_cache = SymsrvDownloader::new(symbol_path, default_downstream.as_deref(), false);
+// Create a downloader which follows the _NT_SYMBOL_PATH recipe.
+let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
+downloader.set_default_downstream_store(symsrv::get_home_sym_dir());
 
 // Download and cache a PDB file.
-let relative_path: PathBuf =
-    ["dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231", "dcomp.pdb"].iter().collect();
-let local_path = symbol_cache.get_file(&relative_path).await?;
+let local_path = downloader.get_file("dcomp.pdb", "648B8DD0780A4E22FA7FA89B84633C231").await?;
 
 // Use the PDB file.
 open_pdb_at_path(&local_path);
 ```
+
+## Command line tool `symfetch`
+
+This repository also contains a small example program called `symfetch`.
+You can install it as follows:
+
+```
+cargo install --examples symsrv
+```
+
+Run it with `symfetch <filename> <hash>` - see `symfetch --help` for details.
 
 ## License
 
