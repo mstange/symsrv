@@ -157,7 +157,7 @@ impl Read for RemotelyFedCursor {
                 &shared.buffer[self.current_pos as usize..][..bytes_to_copy as usize],
             );
         }
-        self.current_pos += bytes_to_copy as u64;
+        self.current_pos += bytes_to_copy;
         Ok(bytes_to_copy as usize)
     }
 }
