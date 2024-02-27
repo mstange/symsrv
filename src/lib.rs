@@ -383,15 +383,24 @@ pub trait SymsrvObserver: Send + Sync + 'static {
     /// given download ID.
     fn on_download_canceled(&self, download_id: u64);
 
+    /// Called when a new CAB extraction is about to start.
     fn on_new_cab_extraction(&self, extraction_id: u64, dest_path: &Path);
+
+    /// Called periodically during a CAB extraction. The byte counts refer to the uncompressed size.
     fn on_cab_extraction_progress(&self, extraction_id: u64, bytes_so_far: u64, total_bytes: u64);
+
+    /// Called when a CAB extraction has completed successfully.
     fn on_cab_extraction_completed(
         &self,
         extraction_id: u64,
         uncompressed_size_in_bytes: u64,
         time_until_completed: Duration,
     );
+
+    /// Called when a CAB extraction has failed.
     fn on_cab_extraction_failed(&self, extraction_id: u64, reason: CabExtractionError);
+
+    /// Called when a CAB extraction has been canceled.
     fn on_cab_extraction_canceled(&self, extraction_id: u64);
 
     /// Called when a file has been created, for example because it was downloaded from
