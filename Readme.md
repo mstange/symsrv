@@ -21,7 +21,7 @@ file cleanup.
 ## Example
 
 ```rust
-use symsrv::{SymsrvDownloader};
+use symsrv::SymsrvDownloader;
 
 // Parse the _NT_SYMBOL_PATH environment variable.
 let symbol_path_env = symsrv::get_symbol_path_from_environment();
