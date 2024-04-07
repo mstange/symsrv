@@ -958,26 +958,35 @@ impl SymsrvDownloaderInner {
         let extraction_id = notifier.extraction_id();
 
         let observer = self.observer.clone();
-        let extracted_size_result =
-            create_file_cleanly(&dest_path, |dest_file: tokio::fs::File| async {
-                {
-                    let mut dest_file = dest_file.into_std().await;
-                    tokio::task::spawn_blocking(move || match cab_data_source {
-                        CabDataSource::Filename(compressed_input_path) => {
-                            let file = std::fs::File::open(compressed_input_path)
-                                .map_err(CabExtractionError::CouldNotOpenCabFile)?;
-                            let buf_read = BufReader::new(file);
-                            extract_cab_to_file(extraction_id, buf_read, &mut dest_file, observer)
-                        }
-                        CabDataSource::Cursor(cursor) => {
-                            extract_cab_to_file(extraction_id, cursor, &mut dest_file, observer)
-                        }
-                    })
-                    .await
-                    .expect("task panicked")
-                }
-            })
-            .await;
+        let extracted_size_result = create_file_cleanly(
+            &dest_path,
+            |mut dest_file: std::fs::File| async {
+                tokio::task::spawn_blocking(move || match cab_data_source {
+                    CabDataSource::Filename(compressed_input_path) => {
+                        let file = std::fs::File::open(compressed_input_path)
+                            .map_err(CabExtractionError::CouldNotOpenCabFile)?;
+                        let buf_read = BufReader::new(file);
+                        extract_cab_to_file(extraction_id, buf_read, &mut dest_file, observer)
+                    }
+                    CabDataSource::Cursor(cursor) => {
+                        extract_cab_to_file(extraction_id, cursor, &mut dest_file, observer)
+                    }
+                })
+                .await
+                .expect("task panicked")
+            },
+            || async {
+                let size = std::fs::metadata(&dest_path)
+                    .map_err(|_| {
+                        CabExtractionError::Other(
+                            "Could not get size of existing extracted file".into(),
+                        )
+                    })?
+                    .len();
+                Ok(size)
+            },
+        )
+        .await;
 
         let extracted_size = match extracted_size_result {
             Ok(size) => size,
@@ -1092,27 +1101,35 @@ impl SymsrvDownloaderInner {
         };
 
         let download_result: Result<u64, CleanFileCreationError<std::io::Error>> =
-            create_file_cleanly(&dest_path, |mut dest_file: tokio::fs::File| async move {
-                let mut buf = vec![0u8; 4096];
-                let mut uncompressed_size_in_bytes = 0;
-                loop {
-                    let count = stream.read(&mut buf).await?;
-                    if count == 0 {
-                        break;
-                    }
-                    uncompressed_size_in_bytes += count as u64;
-                    dest_file.write_all(&buf[..count]).await?;
+            create_file_cleanly(
+                &dest_path,
+                |dest_file: std::fs::File| async move {
+                    let mut dest_file = tokio::fs::File::from_std(dest_file);
+                    let mut buf = vec![0u8; 4096];
+                    let mut uncompressed_size_in_bytes = 0;
+                    loop {
+                        let count = stream.read(&mut buf).await?;
+                        if count == 0 {
+                            break;
+                        }
+                        uncompressed_size_in_bytes += count as u64;
+                        dest_file.write_all(&buf[..count]).await?;
 
-                    if let Some(chunk_consumer) = &mut chunk_consumer {
-                        chunk_consumer.feed(&buf[..count]);
+                        if let Some(chunk_consumer) = &mut chunk_consumer {
+                            chunk_consumer.feed(&buf[..count]);
+                        }
                     }
-                }
-                if let Some(chunk_consumer) = &mut chunk_consumer {
-                    chunk_consumer.mark_complete();
-                }
-                dest_file.flush().await?;
-                Ok(uncompressed_size_in_bytes)
-            })
+                    if let Some(chunk_consumer) = &mut chunk_consumer {
+                        chunk_consumer.mark_complete();
+                    }
+                    dest_file.flush().await?;
+                    Ok(uncompressed_size_in_bytes)
+                },
+                || async {
+                    let size = std::fs::metadata(&dest_path)?.len();
+                    Ok(size)
+                },
+            )
             .await;
 
         let uncompressed_size_in_bytes = match download_result {
