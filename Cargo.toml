@@ -11,7 +11,7 @@ exclude = ["/.github", "/tests"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-reqwest = { version = "0.11.14", default-features = false, features = [
+reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream"
 ] }
@@ -19,7 +19,7 @@ dirs = "5"
 tokio = { version = "1.25.0", default-features = false, features = ["fs"] }
 thiserror = "1.0.26"
 # cab = { path = "../rust-cab" }
-cab = "0.5"
+cab = "0.6"
 futures-util = { version = "0.3.30", default-features = false, features = ["io"] }
 fs4 = { version = "0.8.0", features = ["tokio"] }
 async-compression = { version = "0.4.6", default-features = false, features = [
@@ -27,7 +27,7 @@ async-compression = { version = "0.4.6", default-features = false, features = [
     "futures-io",
     "gzip"
 ] }
-http = "0.2.11"
+http = "1"
 scopeguard = { version = "1.2.0", default-features = false }
 
 [dev-dependencies]
