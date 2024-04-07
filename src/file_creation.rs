@@ -99,6 +99,7 @@ where
         let temp_file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&temp_file_path)
             .await
             .map_err(CleanFileCreationError::TempFileCreation)?;
