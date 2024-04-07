@@ -486,6 +486,47 @@ async fn test_simple_server_two_requests() {
     );
 }
 
+#[tokio::test]
+async fn test_simple_server_two_downloaders() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
+    // The cache starts out empty.
+    let cache1 = TestCacheDir::prepare(&[]).unwrap();
+
+    // The server has a single, uncompressed, file.
+    let server1 =
+        TestSymbolServer::prepare(&["ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"]).await;
+
+    let (symbol_cache1, _) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+    );
+    let (symbol_cache2, _) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+    );
+    let res1_future = symbol_cache1.get_file("ShowSSEConfig.exe", "63E6C7F78000");
+    let res2_future = symbol_cache2.get_file("ShowSSEConfig.exe", "63E6C7F78000");
+    let (res1, res2) = futures_util::future::join(res1_future, res2_future).await;
+    if res1.is_err() || res2.is_err() {
+        panic!(
+            "Should find an uncompressed symbol file by downloading the uncompressed file, and the two requests shouldn't stomp on each other. {res1:?}, {res2:?}"
+        );
+    }
+    assert!(
+        cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The uncompressed file should be stored in the cache."
+    );
+}
+
 // A test where the response from the server is partial and then the connection is aborted.
 #[tokio::test]
 async fn test_aborted_response() {
