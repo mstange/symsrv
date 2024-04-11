@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use fs4::FileExt;
+use fs4::{lock_contended_error, FileExt};
 
 /// The error type for the `create_file_cleanly` function.
 #[derive(thiserror::Error, Debug)]
@@ -189,13 +189,11 @@ async fn lock_file_exclusive(file: std::fs::File) -> Result<std::fs::File, io::E
     for _ in 0..5 {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(e) => match e.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => {
-                    return lock_file_exclusive_with_blocking_thread(file).await
-                }
-                _ => return Err(e),
-            },
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.raw_os_error() == lock_contended_error().raw_os_error() => {
+                return lock_file_exclusive_with_blocking_thread(file).await
+            }
+            Err(e) => return Err(e),
         }
     }
     Err(io::Error::new(
@@ -238,10 +236,8 @@ fn lock_file_exclusive_blocking_this_thread(
         match file.lock_exclusive() {
             // can block
             Ok(()) => return Ok(file),
-            Err(e) => match e.kind() {
-                io::ErrorKind::Interrupted => continue,
-                _ => return Err(e),
-            },
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
     Err(io::Error::new(
