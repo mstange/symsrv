@@ -16,12 +16,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream"
 ] }
 dirs = "5"
-tokio = { version = "1.25.0", default-features = false, features = ["fs"] }
-thiserror = "1.0.26"
+tokio = { version = "1.39", default-features = false, features = ["fs"] }
+thiserror = "1"
 # cab = { path = "../rust-cab" }
 cab = "0.6"
 futures-util = { version = "0.3.30", default-features = false, features = ["io"] }
-fs4 = { version = "0.8.0" }
+fs4 = { version = "0.9" }
 async-compression = { version = "0.4.6", default-features = false, features = [
     "tokio",
     "futures-io",
@@ -31,12 +31,12 @@ http = "1"
 scopeguard = { version = "1.2.0", default-features = false }
 
 [dev-dependencies]
-tempfile = "3.1.0"
-mockito = "1.2"
-tokio = { version = "1.25.0", default-features = false, features = [
+tempfile = "3.10"
+mockito = "1.4"
+tokio = { version = "1.39", default-features = false, features = [
     "macros",
     "rt",
     "rt-multi-thread"
 ] }
-indicatif = "0.17.3"
-clap = { version = "4.5.1", features = ["derive"] }
+indicatif = "0.17"
+clap = { version = "4.5", features = ["derive"] }
