@@ -17,11 +17,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 dirs = "5"
 tokio = { version = "1.39", default-features = false, features = ["fs"] }
-thiserror = "1"
+thiserror = "2"
 # cab = { path = "../rust-cab" }
 cab = "0.6"
 futures-util = { version = "0.3.30", default-features = false, features = ["io"] }
-fs4 = { version = "0.9" }
+fs4 = { version = "0.12" }
 async-compression = { version = "0.4.6", default-features = false, features = [
     "tokio",
     "futures-io",
