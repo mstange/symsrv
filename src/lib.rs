@@ -1105,7 +1105,7 @@ impl SymsrvDownloaderInner {
                 &dest_path,
                 |dest_file: std::fs::File| async move {
                     let mut dest_file = tokio::fs::File::from_std(dest_file);
-                    let mut buf = vec![0u8; 4096];
+                    let mut buf = vec![0u8; 2 * 1024 * 1024];
                     let mut uncompressed_size_in_bytes = 0;
                     loop {
                         let count = stream.read(&mut buf).await?;
