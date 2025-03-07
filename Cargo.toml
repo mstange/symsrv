@@ -21,7 +21,7 @@ thiserror = "2"
 # cab = { path = "../rust-cab" }
 cab = "0.6"
 futures-util = { version = "0.3.30", default-features = false, features = ["io"] }
-fs4 = { version = "0.12" }
+fs4 = { version = "0.13" }
 async-compression = { version = "0.4.6", default-features = false, features = [
     "tokio",
     "futures-io",
