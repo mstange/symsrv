@@ -7,13 +7,21 @@ fn get_header<K: AsHeaderName>(headers: &HeaderMap, name: K) -> Option<String> {
     Some(headers.get(name)?.to_str().ok()?.to_ascii_lowercase())
 }
 
+fn get_content_encoding(headers: &HeaderMap) -> Option<String> {
+    // An empty header should be treated as if it is not present. This conforms to
+    // RFC 9110 (section 8.4) which states that the list may be empty.
+    // In practice, empty headers show up on https://symbolserver.unity3d.com/
+    // (the Unity symbol server) as of November 2026.
+    get_header(headers, CONTENT_ENCODING).filter(|encoding| !encoding.is_empty())
+}
+
 enum TotalSize {
     Compressed(u64),
     Uncompressed(u64),
 }
 
 fn get_total_size(headers: &HeaderMap) -> Option<TotalSize> {
-    let response_encoding = get_header(headers, CONTENT_ENCODING);
+    let response_encoding = get_content_encoding(headers);
     let content_length =
         get_header(headers, CONTENT_LENGTH).and_then(|value| value.parse::<u64>().ok());
 
@@ -68,7 +76,7 @@ where
     F: FnMut(u64, Option<u64>) + Send + Sync + 'static,
 {
     let headers = response.headers();
-    let response_encoding = get_header(headers, CONTENT_ENCODING);
+    let response_encoding = get_content_encoding(headers);
     let total_size = get_total_size(headers);
 
     let stream = response.bytes_stream();
