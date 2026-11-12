@@ -143,6 +143,17 @@ impl TestSymbolServer {
         self.mocks.push(mock);
     }
 
+    pub async fn add_mock_with_content_encoding(&mut self, rel_path: &str, content_encoding: &str) {
+        let mock = self
+            .server
+            .mock("GET", format!("/{rel_path}").as_str())
+            .with_header("Content-Encoding", content_encoding)
+            .with_body_from_file(path_to_fixture(rel_path))
+            .create_async()
+            .await;
+        self.mocks.push(mock);
+    }
+
     pub fn url(&self) -> String {
         self.server.url()
     }
@@ -741,6 +752,41 @@ async fn test_server_with_cab_compression() {
     assert!(
         !default_downstream.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
         "The uncompressed file should NOT be stored in the default downstream store."
+    );
+}
+
+// An empty Content-Encoding header should be interpreted as having no encoding on the response.
+#[tokio::test]
+async fn test_server_with_empty_content_encoding() {
+    let default_downstream = TestCacheDir::prepare(&[]).unwrap();
+
+    // The cache starts out empty.
+    let cache1 = TestCacheDir::prepare(&[]).unwrap();
+
+    // The server serves one uncompressed file, with an empty Content-Encoding.
+    let mut server1 = TestSymbolServer::prepare(&[]).await;
+    server1
+        .add_mock_with_content_encoding("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe", "")
+        .await;
+
+    let (symbol_cache, _) = make_symbol_cache(
+        vec![NtSymbolPathEntry::Chain {
+            dll: "symsrv.dll".into(),
+            cache_paths: vec![cache1.cache_path()],
+            urls: vec![server1.url()],
+        }],
+        Some(default_downstream.path()),
+    );
+    let res = symbol_cache
+        .get_file("ShowSSEConfig.exe", "63E6C7F78000")
+        .await;
+    assert!(
+        matches!(res, Ok(path) if file_matches_fixture(&path, "ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe")),
+        "The file should be downloaded successfully."
+    );
+    assert!(
+        cache1.contains_file("ShowSSEConfig.exe/63E6C7F78000/ShowSSEConfig.exe"),
+        "The file should be stored in the cache."
     );
 }
 
